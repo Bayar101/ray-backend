@@ -1,0 +1,16 @@
+# Air configuration for live reload
+# https://github.com/air-verse/air
+
+root = "."
+tmp_dir = "tmp"
+
+[build]
+    bin = "./tmp/server"
+    cmd = "go build -o ./tmp/server ./cmd/server"
+    delay = 1000
+    include_ext = ["go", "yml", "yaml", "toml"]
+    exclude_dir = ["tmp", "vendor"]
+    kill_delay = "0s"
+
+[log]
+    time = true

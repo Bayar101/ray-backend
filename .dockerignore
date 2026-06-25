@@ -1,0 +1,43 @@
+# Version control
+.git
+.gitignore
+.gitattributes
+
+# Live-reload, build, debug artifacts
+tmp/
+logs/
+__debug_bin*
+*.test
+*.out
+coverage*
+bin/
+out/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Local env
+.env
+.env.*
+!.env.example
+
+# Test code (not needed for prod binary)
+tests/
+
+# Docs that aren't compiled into the binary
+docs/superpowers/
+
+# Internal tools (not imported by main/cmd)
+tools/
+
+# Markdown / planning
+*.md
+.claude/
+
+# Don't ship Docker meta into context
+Dockerfile
+.dockerignore
+docker-compose*.yml

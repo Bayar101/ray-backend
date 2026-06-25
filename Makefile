@@ -1,0 +1,4 @@
+.PHONY: air
+
+air:
+	air

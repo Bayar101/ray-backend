@@ -1,0 +1,13 @@
+app:
+  port: "8080"
+  mode: development
+  base_url: http://localhost:8080
+
+db:
+  host: localhost
+  port: "5999"
+  user: ray
+  password: ray
+  name: ray
+  ssl_mode: disable
+  time_zone: Asia/Ulaanbaatar
