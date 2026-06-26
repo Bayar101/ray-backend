@@ -19,16 +19,21 @@ func NewRoutineHandler(svc *services.RoutineService) *RoutineHandler {
 }
 
 func (h *RoutineHandler) Register(rg fiber.Router) {
-	rg.Post("/routines", h.Create)
-	rg.Get("/routines", h.List)
-	rg.Get("/routines/:id", h.Get)
-	rg.Post("/routines/:id/complete", h.Complete)
+	rg.Post("/create", h.Create)
+	rg.Get("/list", h.List)
+	rg.Get("/get/:id", h.Get)
+	rg.Post("/complete/:id", h.Complete)
 	rg.Get("/history?date=YYYY-MM-DD", h.DailyHistory)
 }
 
 type createRoutineInput struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
+	Name        string `json:"name" validate:"required,min=1,max=100"`
+	Description string `json:"description" validate:"max=1000"`
+}
+
+type updateRoutineInput struct {
+	Name        string `json:"name" validate:"omitempty,min=1,max=100"`
+	Description string `json:"description" validate:"omitempty,max=1000"`
 }
 
 func (h *RoutineHandler) Create(c fiber.Ctx) error {
@@ -36,8 +41,8 @@ func (h *RoutineHandler) Create(c fiber.Ctx) error {
 	if err := c.Bind().Body(&input); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
 	}
-	if input.Name == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "name is required"})
+	if err := validate.Struct(input); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": validationErrors(err)})
 	}
 
 	routine, err := h.svc.Create(c.Context(), input.Name, input.Description)
@@ -68,6 +73,43 @@ func (h *RoutineHandler) Get(c fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
 	}
 	return c.Status(fiber.StatusOK).JSON(routine)
+}
+
+func (h *RoutineHandler) Update(c fiber.Ctx) error {
+	id, err := strconv.Atoi(c.Params("id"))
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid id"})
+	}
+	var input updateRoutineInput
+	if err := c.Bind().Body(&input); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
+	}
+	if err := validate.Struct(input); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": validationErrors(err)})
+	}
+
+	routine, err := h.svc.Update(c.Context(), uint(id), input.Name, input.Description)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "routine not found"})
+		}
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.Status(fiber.StatusOK).JSON(routine)
+}
+
+func (h *RoutineHandler) Delete(c fiber.Ctx) error {
+	id, err := strconv.Atoi(c.Params("id"))
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid id"})
+	}
+	if err := h.svc.Delete(c.Context(), uint(id)); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "routine not found"})
+		}
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{"message": "routine deleted"})
 }
 
 func (h *RoutineHandler) Complete(c fiber.Ctx) error {

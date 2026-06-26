@@ -8,7 +8,7 @@ import (
 	"github.com/gofiber/fiber/v3/middleware/recover"
 )
 
-func Register(app *fiber.App, h *handlers.RoutineHandler) {
+func Register(app *fiber.App, h *handlers.RoutineHandler, th *handlers.TransactionHandler) {
 	app.Use(logger.New())
 	app.Use(recover.New())
 	app.Use(cors.New())
@@ -18,9 +18,7 @@ func Register(app *fiber.App, h *handlers.RoutineHandler) {
 	})
 
 	api := app.Group("/api")
-	api.Post("/routines", h.Create)
-	api.Get("/routines", h.List)
-	api.Get("/routines/:id", h.Get)
-	api.Post("/routines/:id/complete", h.Complete)
-	api.Get("/history", h.DailyHistory)
+
+	h.Register(api.Group("/routines"))
+	th.Register(api.Group("/transactions"))
 }

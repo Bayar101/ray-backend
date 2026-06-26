@@ -638,3 +638,570 @@ curl "http://localhost:8080/api/history?date=2026-06-23"
 | Panic in terminal | `recover.New()` not added, or a nil service/handler. |
 | CORS error from frontend | `cors.New()` not added, or origin not in the allow-list. |
 | `go.mod requires go >= 1.26` in Docker | Builder image Go version is older than `go.mod`. Bump the `golang:` tag. |
+
+---
+
+## Next steps
+
+Steps 1–9 ship a working MVP: create/list/get/complete routines and a daily history,
+served from Postgres, tested, and dockerized. Steps 10–17 take it from "runs on my machine"
+to "I'd let other people use it." Same two-part format — **Simple implementation** to get it
+working, **Best practice** (with examples) for when you harden it.
+
+## Step 10 — Finish the CRUD: Update & Delete
+
+A routine can be created but never edited or removed. Add `Update` and `Delete` to the
+service, handlers, and routes. `Delete` is a **soft delete** — `Base.DeletedAt` makes GORM
+set `deleted_at` instead of removing the row.
+
+### Simple implementation
+
+Service:
+
+```go
+func (s *RoutineService) Update(ctx context.Context, id uint, name, description string) (models.Routine, error) {
+    var routine models.Routine
+    if err := s.db.WithContext(ctx).First(&routine, id).Error; err != nil {
+        return models.Routine{}, fmt.Errorf("failed to get routine: %w", err)
+    }
+    if name != "" {
+        routine.Name = name
+    }
+    if description != "" {
+        routine.Description = description
+    }
+    if err := s.db.WithContext(ctx).Save(&routine).Error; err != nil {
+        return models.Routine{}, fmt.Errorf("failed to update routine: %w", err)
+    }
+    return routine, nil
+}
+
+func (s *RoutineService) Delete(ctx context.Context, id uint) error {
+    res := s.db.WithContext(ctx).Delete(&models.Routine{}, id)
+    if res.Error != nil {
+        return fmt.Errorf("failed to delete routine: %w", res.Error)
+    }
+    return nil
+}
+```
+
+Routes:
+
+```go
+api.Put("/routines/:id", h.Update)
+api.Delete("/routines/:id", h.Delete)
+```
+
+> **Bug to avoid — load *then* mutate.** If you set `routine.Name = name` *before* calling
+> `First(&routine, id)`, the `First` scan overwrites the struct and your changes are lost —
+> the update silently no-ops. Always `First` first, apply changes second, `Save` last.
+
+### Best practice
+
+- **Detect the missing row on delete.** GORM's `Delete` does **not** return
+  `ErrRecordNotFound` — deleting a non-existent id gives `err == nil` and
+  `RowsAffected == 0`. Without this check the handler returns `200 "deleted"` for a routine
+  that never existed:
+
+  ```go
+  func (s *RoutineService) Delete(ctx context.Context, id uint) error {
+      res := s.db.WithContext(ctx).Delete(&models.Routine{}, id)
+      if res.Error != nil {
+          return fmt.Errorf("failed to delete routine: %w", res.Error)
+      }
+      if res.RowsAffected == 0 {
+          return gorm.ErrRecordNotFound
+      }
+      return nil
+  }
+  ```
+
+- **Map `ErrRecordNotFound` → `404`** in both handlers, same as `Get`:
+
+  ```go
+  if err := h.svc.Delete(c.Context(), uint(id)); err != nil {
+      if errors.Is(err, gorm.ErrRecordNotFound) {
+          return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "routine not found"})
+      }
+      return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+  }
+  ```
+
+- **Pick the right verb for partial vs full update.** A handler that only changes the
+  non-empty fields is `PATCH` semantics. Either use `api.Patch(...)`, or accept the whole
+  object and replace it for true `PUT`. Don't label a partial update `PUT`.
+- **Soft delete leaves child rows.** `RoutineLog`'s `OnDelete:CASCADE` only fires on a real
+  `DELETE`; a soft delete is an `UPDATE`, so the logs linger (invisible, since queries
+  filter `deleted_at IS NULL`). Fine here — just know they're there if you ever hard-delete.
+
+---
+
+## Step 11 — Unique routine name (409 Conflict)
+
+Two live routines named "Morning run" is a bug, not a feature. Enforce uniqueness at the
+**database** (the only race-safe guard), then translate the violation to `409`.
+
+### Simple implementation
+
+Tag the field so new databases get the index:
+
+```go
+// internal/models/routine.go
+Name string `gorm:"not null;uniqueIndex" json:"name"`
+```
+
+`AutoMigrate` then runs `CREATE UNIQUE INDEX idx_routines_name ON routines(name)`.
+
+> **Two gotchas on an existing table:**
+> 1. **Duplicates already present → migration fails.** Postgres won't build a unique index
+>    over duplicate rows. Find and clear them first:
+>    ```sql
+>    SELECT name, COUNT(*) FROM routines GROUP BY name HAVING COUNT(*) > 1;
+>    ```
+> 2. **Soft delete breaks a plain `uniqueIndex`.** It covers *all* rows incl. soft-deleted,
+>    so create → delete → recreate the same name fails. Use the partial index below.
+
+### Best practice
+
+- **Partial unique index on live rows only.** GORM struct tags can't express a `WHERE`
+  clause, so leave the tag plain and create the index after `AutoMigrate`:
+
+  ```go
+  // internal/database/database.go, after AutoMigrate
+  if err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_routines_name_active
+      ON routines (name) WHERE deleted_at IS NULL`).Error; err != nil {
+      return nil, fmt.Errorf("create unique name index: %w", err)
+  }
+  ```
+
+  > Don't try a composite `uniqueIndex` on `(name, deleted_at)` — Postgres treats `NULL`s
+  > as distinct, so two live rows (`deleted_at = NULL`) slip past. Must be the partial
+  > `WHERE deleted_at IS NULL` index.
+
+- **Catch the violation, don't pre-`SELECT`.** A "does this name exist?" check before
+  insert is a race — two requests both see "free" and both insert. Let the DB reject it and
+  translate Postgres error code `23505`:
+
+  ```go
+  import "github.com/jackc/pgx/v5/pgconn"
+
+  var ErrDuplicateName = errors.New("routine name already exists")
+
+  if err := s.db.WithContext(ctx).Create(&r).Error; err != nil {
+      var pgErr *pgconn.PgError
+      if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+          return models.Routine{}, ErrDuplicateName
+      }
+      return models.Routine{}, fmt.Errorf("failed to create routine: %w", err)
+  }
+  ```
+
+- **Map `ErrDuplicateName` → `409`** in the handler (do the same in `Update` — a rename to
+  a taken name also hits `23505`):
+
+  ```go
+  if errors.Is(err, services.ErrDuplicateName) {
+      return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "routine name already exists"})
+  }
+  ```
+
+- **`go mod tidy`** after importing `pgconn` — it's currently an indirect dependency.
+- **Test the 409 against real Postgres.** `pgconn.PgError` won't surface from the SQLite
+  test DB (different error type), so the conflict path needs a Postgres integration test
+  (Step 15).
+
+---
+
+## Step 12 — Input validation as a layer
+
+Hand-written `if name == ""` works for one field; it won't scale. Move validation to a
+declarative layer with [`go-playground/validator`](https://github.com/go-playground/validator),
+running at the HTTP boundary *before* the service is called.
+
+### Simple implementation
+
+```bash
+go get github.com/go-playground/validator/v10
+```
+
+One shared validator instance (reused — don't construct per request):
+
+```go
+// internal/handlers/validate.go
+package handlers
+
+import "github.com/go-playground/validator/v10"
+
+var validate = validator.New(validator.WithRequiredStructEnabled())
+```
+
+Tagged DTOs, validated in the handler:
+
+```go
+type createRoutineInput struct {
+    Name        string `json:"name"        validate:"required,min=1,max=100"`
+    Description string `json:"description" validate:"max=1000"`
+}
+
+func (h *RoutineHandler) Create(c fiber.Ctx) error {
+    var input createRoutineInput
+    if err := c.Bind().Body(&input); err != nil {
+        return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
+    }
+    if err := validate.Struct(input); err != nil {
+        return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+    }
+    // ... call service
+}
+```
+
+The tag replaces the manual empty-name check in both the handler *and* the service — the
+boundary now guarantees valid input, so the service can trust it.
+
+> **`omitempty` for partial updates.** `Update` is partial (empty field = "leave it"), so
+> its DTO must not mark fields `required`: use `validate:"omitempty,min=1,max=100"`. The
+> rules apply only when the field is present.
+
+### Best practice
+
+- **Return field-level messages,** not validator's raw dump. Map the error:
+
+  ```go
+  func validationErrors(err error) map[string]string {
+      out := map[string]string{}
+      var ve validator.ValidationErrors
+      if errors.As(err, &ve) {
+          for _, fe := range ve {
+              switch fe.Tag() {
+              case "required":
+                  out[fe.Field()] = fe.Field() + " is required"
+              case "max":
+                  out[fe.Field()] = fe.Field() + " too long (max " + fe.Param() + ")"
+              default:
+                  out[fe.Field()] = "invalid " + fe.Field()
+              }
+          }
+      }
+      return out
+  }
+  // → {"errors": {"Name": "Name is required"}}
+  ```
+
+- **Hook the validator into Fiber** so `Bind().Body()` validates automatically (one less
+  call per handler):
+
+  ```go
+  type structValidator struct{ v *validator.Validate }
+  func (s structValidator) Validate(out any) error { return s.v.Struct(out) }
+
+  app := fiber.New(fiber.Config{
+      StructValidator: structValidator{v: validator.New()},
+  })
+  ```
+
+- **Keep validation (`400`) separate from uniqueness (`409`).** The validator can't know a
+  name is already taken — that's a DB round-trip (Step 11). Validator → `400`,
+  `23505` → `409`.
+
+---
+
+## Step 13 — Harden routes & middleware
+
+Step 6 shipped the middleware defaults. Here are the production versions, each with the
+example.
+
+### Simple implementation
+
+The Step 6 stack — `logger`, `recover`, `cors.New()`, one `/health` — is the simple
+version. Everything below tightens it.
+
+### Best practice
+
+- **Config-driven CORS allow-list** instead of all-origins default, so dev and prod differ
+  without code changes:
+
+  ```go
+  app.Use(cors.New(cors.Config{
+      AllowOrigins: cfg.CORS.AllowedOrigins, // ["http://localhost:5173"] in dev
+      AllowMethods: []string{"GET", "POST", "PUT", "DELETE"},
+  }))
+  ```
+
+- **Request-ID middleware before the logger,** so every log line and error carries a
+  correlation ID:
+
+  ```go
+  import "github.com/gofiber/fiber/v3/middleware/requestid"
+
+  app.Use(requestid.New())
+  app.Use(logger.New())
+  // in a handler: reqID := requestid.FromContext(c)
+  ```
+
+- **Request-timeout middleware** so a slow query can't pin a connection. Relies on the
+  `WithContext(ctx)` discipline already in the service layer to actually cancel the query:
+
+  ```go
+  app.Use(func(c fiber.Ctx) error {
+      ctx, cancel := context.WithTimeout(c.Context(), 5*time.Second)
+      defer cancel()
+      c.SetContext(ctx)
+      return c.Next()
+  })
+  ```
+
+- **Split liveness from readiness** — orchestrators use them differently:
+
+  ```go
+  app.Get("/health", func(c fiber.Ctx) error { return c.SendString("ok") }) // process up
+  app.Get("/ready", func(c fiber.Ctx) error {                                // deps reachable
+      sqlDB, _ := db.DB()
+      if err := sqlDB.Ping(); err != nil {
+          return c.SendStatus(fiber.StatusServiceUnavailable)
+      }
+      return c.SendString("ready")
+  })
+  ```
+
+- **Version the API** so breaking changes ship under `/v2` without breaking clients:
+
+  ```go
+  api := app.Group("/api/v1")
+  ```
+
+---
+
+## Step 14 — Production-grade `main.go`
+
+Step 7's `main` loads, connects, and listens — but `log.Fatal` skips cleanup and a `Ctrl-C`
+drops in-flight requests. Harden the entrypoint.
+
+### Simple implementation
+
+The Step 7 `main` (load config → connect → build → listen) is the simple version.
+
+### Best practice
+
+- **Extract `run() error`** so deferred cleanup runs (`defer` doesn't fire on
+  `os.Exit`, which `log.Fatal` calls):
+
+  ```go
+  func main() {
+      if err := run(); err != nil {
+          log.Fatal(err)
+      }
+  }
+
+  func run() error {
+      cfg, err := config.Load()
+      if err != nil {
+          return err
+      }
+      // ... build app
+  }
+  ```
+
+- **Graceful shutdown** on `SIGINT`/`SIGTERM` so in-flight requests finish and the pool
+  closes cleanly:
+
+  ```go
+  go func() { _ = app.Listen(":" + cfg.App.Port) }()
+
+  quit := make(chan os.Signal, 1)
+  signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+  <-quit
+  _ = app.ShutdownWithTimeout(10 * time.Second)
+  ```
+
+- **Structured logging** with `log/slog` instead of the standard `log`, so prod logs are
+  queryable JSON:
+
+  ```go
+  logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+  slog.SetDefault(logger)
+  slog.Info("server starting", "port", cfg.App.Port)
+  ```
+
+- **Configure the connection pool** (Step 3) once the DB is open:
+
+  ```go
+  sqlDB, _ := db.DB()
+  sqlDB.SetMaxOpenConns(25)
+  sqlDB.SetMaxIdleConns(5)
+  sqlDB.SetConnMaxLifetime(time.Hour)
+  ```
+
+---
+
+## Step 15 — Broaden the test suite
+
+Only `Create` is covered. Add cases for every method, with the gnarly date logic getting
+the most attention.
+
+### Simple implementation
+
+Table-driven service tests against the in-memory SQLite DB from Step 8. The highest-value
+target is `DailyHistory` — its day-boundary JOIN is the easiest thing to get subtly wrong:
+
+```go
+func TestDailyHistory(t *testing.T) {
+    tests := []struct {
+        name          string
+        completeOnDay bool
+        offsetDays    int  // query date relative to completion day
+        wantCompleted bool
+    }{
+        {"completed today",     true,  0,  true},
+        {"not completed",       false, 0,  false},
+        {"completed other day", true,  -1, false}, // log exists, wrong day
+    }
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            svc := services.NewRoutineService(newTestDB(t)) // fresh DB per case
+            r, _ := svc.Create(t.Context(), "Run", "")
+            if tt.completeOnDay {
+                svc.Complete(t.Context(), r.ID)
+            }
+            day := time.Now().AddDate(0, 0, tt.offsetDays)
+            entries, err := svc.DailyHistory(t.Context(), day)
+            if err != nil {
+                t.Fatal(err)
+            }
+            if entries[0].Completed != tt.wantCompleted {
+                t.Fatalf("completed = %v, want %v", entries[0].Completed, tt.wantCompleted)
+            }
+        })
+    }
+}
+```
+
+### Best practice
+
+- **Handler tests** via `app.Test(req)` to assert status codes and JSON shape end-to-end:
+
+  ```go
+  req := httptest.NewRequest("GET", "/api/routines/999", nil)
+  resp, _ := app.Test(req)
+  if resp.StatusCode != fiber.StatusNotFound {
+      t.Fatalf("got %d, want 404", resp.StatusCode)
+  }
+  ```
+
+- **Integration tests against real Postgres** with
+  [testcontainers-go](https://github.com/testcontainers/testcontainers-go) — SQLite and
+  Postgres differ enough (types, constraints, the `23505` path from Step 11) that a green
+  SQLite test can hide a Postgres bug:
+
+  ```go
+  pg, _ := postgres.Run(ctx, "postgres:16",
+      postgres.WithDatabase("test"), postgres.WithUsername("t"), postgres.WithPassword("t"))
+  t.Cleanup(func() { pg.Terminate(ctx) })
+  ```
+
+- **`t.Cleanup()`** for teardown instead of manual defer chains, and **`go test -cover ./...`**
+  to find untested branches — focus coverage on the service layer where the logic lives.
+
+---
+
+## Step 16 — Versioned migrations
+
+`AutoMigrate` only *adds* — it can't express renames, backfills, or safe column drops, and
+auto-running schema changes on every deploy is risky. Graduate to checked-in migration
+files.
+
+### Simple implementation
+
+Keep `AutoMigrate` for local/dev and tests; that's the simple version and it's fine until
+you ship to a shared environment.
+
+### Best practice
+
+- **Adopt [`golang-migrate`](https://github.com/golang-migrate/migrate)** (or
+  [`goose`](https://github.com/pressly/goose)). Each change is a numbered `up`/`down` pair
+  checked into the repo:
+
+  ```
+  migrations/
+  ├── 000001_create_routines.up.sql
+  ├── 000001_create_routines.down.sql
+  ├── 000002_unique_name_index.up.sql   -- the Step 11 partial index lives here
+  └── 000002_unique_name_index.down.sql
+  ```
+
+  ```sql
+  -- 000002_unique_name_index.up.sql
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_routines_name_active
+      ON routines (name) WHERE deleted_at IS NULL;
+  ```
+
+- **Run migrations as an explicit deploy step,** not on app boot:
+
+  ```bash
+  migrate -path ./migrations -database "$DATABASE_URL" up
+  ```
+
+- **Disable `AutoMigrate` in production** (gate it on `cfg.App.Mode != "production"`) so the
+  migration files are the single source of schema truth.
+
+---
+
+## Step 17 — CI pipeline
+
+Stop "works on my machine" regressions before they merge. A push-triggered workflow that
+builds, vets, and tests.
+
+### Simple implementation
+
+A GitHub Actions workflow at `.github/workflows/ci.yml`:
+
+```yaml
+name: CI
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.26' }
+      - run: go vet ./...
+      - run: go test -race ./...
+      - run: go build ./...
+```
+
+### Best practice
+
+- **Add static analysis** with [`golangci-lint`](https://golangci-lint.run/) — catches far
+  more than `go vet`:
+
+  ```yaml
+      - uses: golangci/golangci-lint-action@v6
+  ```
+
+- **Run integration tests too.** Actions provides Postgres as a service container, so the
+  testcontainers/Postgres tests from Step 15 run in CI:
+
+  ```yaml
+      services:
+        postgres:
+          image: postgres:16
+          env: { POSTGRES_PASSWORD: test }
+          ports: ["5432:5432"]
+          options: >-
+            --health-cmd pg_isready --health-interval 5s --health-retries 5
+  ```
+
+- **Gate merges on CI** with a branch-protection rule, and **report coverage**
+  (`go test -coverprofile=cover.out ./...`) so it can't silently rot.
+
+---
+
+## Further out
+
+- **Auth & multi-tenant** — users own their routines (`user_id` FK, JWT or session
+  middleware, scope every query by the authenticated user).
+- **Pagination & filtering** on `List` (`?limit=&offset=`, or keyset pagination) before the
+  table grows.
+- **Observability** — structured logs + metrics (Prometheus `/metrics`) + tracing.
+- **Rate limiting** (`limiter` middleware) on write endpoints.
+- **OpenAPI spec** generated from the handlers so the frontend has a typed contract.

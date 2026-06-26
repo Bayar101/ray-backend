@@ -6,7 +6,7 @@ import (
 
 type Routine struct {
 	Base
-	Name        string `gorm:"not null" json:"name"`
+	Name        string `gorm:"not null;uniqueIndex" json:"name"`
 	Description string `gorm:"type:text;" json:"description"`
 }
 

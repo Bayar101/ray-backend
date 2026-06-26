@@ -18,8 +18,10 @@ func Connect(cfg config.DB) (*gorm.DB, error) {
 		return nil, err
 	}
 	sqlDB, _ := db.DB()
-	sqlDB.SetMaxOpenConns(25)
-	sqlDB.SetMaxIdleConns(5)
-	sqlDB.SetConnMaxLifetime(time.Hour)
+	sqlDB.SetMaxOpenConns(70)
+	sqlDB.SetMaxIdleConns(10)
+	sqlDB.SetConnMaxLifetime(30 * time.Minute)
+	sqlDB.SetConnMaxIdleTime(5 * time.Minute)
+
 	return db, nil
 }

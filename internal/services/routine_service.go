@@ -52,6 +52,34 @@ func (s *RoutineService) Get(ctx context.Context, id uint) (models.Routine, erro
 	return routine, nil
 }
 
+func (s *RoutineService) Update(ctx context.Context, id uint, name, description string) (models.Routine, error) {
+	var routine models.Routine
+	if err := s.db.WithContext(ctx).First(&routine, id).Error; err != nil {
+		return models.Routine{}, fmt.Errorf("failed to get routine: %w", err)
+	}
+	if name != "" {
+		routine.Name = name
+	}
+	if description != "" {
+		routine.Description = description
+	}
+	if err := s.db.WithContext(ctx).Save(&routine).Error; err != nil {
+		return models.Routine{}, fmt.Errorf("failed to update routine: %w", err)
+	}
+	return routine, nil
+}
+
+func (s *RoutineService) Delete(ctx context.Context, id uint) error {
+	res := s.db.WithContext(ctx).Delete(&models.Routine{}, id)
+	if res.Error != nil {
+		return fmt.Errorf("failed to delete routine: %w", res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
+
 func (s *RoutineService) Complete(ctx context.Context, id uint) (models.RoutineLog, error) {
 	var r models.Routine
 	if err := s.db.WithContext(ctx).First(&r, id).Error; err != nil {
@@ -66,35 +94,6 @@ func (s *RoutineService) Complete(ctx context.Context, id uint) (models.RoutineL
 	}
 	return log, nil
 }
-
-// func (s *RoutineService) DailyHistory(ctx context.Context, date time.Time) ([]DailyEntry, error) {
-// 	var routines []models.Routine
-// 	res := s.db.WithContext(ctx).Find(&routines)
-// 	if res.Error != nil {
-// 		return nil, res.Error
-// 	}
-
-// 	var entries []DailyEntry
-// 	for _, routine := range routines {
-// 		count := int64(0)
-// 		startOfDay := time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, time.UTC)
-// 		endOfDay := startOfDay.Add(24 * time.Hour)
-// 		res := s.db.WithContext(ctx).
-// 			Model(&models.RoutineLog{}).
-// 			Where("routine_id = ? AND completed_at BETWEEN ? AND ?", routine.ID, startOfDay, endOfDay).
-// 			Count(&count)
-
-// 		if res.Error != nil {
-// 			return nil, res.Error
-// 		}
-// 		entries = append(entries, DailyEntry{
-// 			Routine:   routine,
-// 			Completed: count > 0,
-// 		})
-// 	}
-
-// 	return entries, nil
-// }
 
 func (s *RoutineService) DailyHistory(ctx context.Context, date time.Time) ([]DailyEntry, error) {
 	startOfDay := time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, time.UTC)
