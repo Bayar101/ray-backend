@@ -3,11 +3,20 @@ package main
 import (
 	"log"
 
-	"github.com/Bayar101/ray-backend/internal/config"
-	"github.com/Bayar101/ray-backend/internal/database"
-	"github.com/Bayar101/ray-backend/internal/handlers"
+	"github.com/Bayar101/ray-backend/internal/platform/config"
+	"github.com/Bayar101/ray-backend/internal/platform/database"
 	"github.com/Bayar101/ray-backend/internal/routes"
-	"github.com/Bayar101/ray-backend/internal/services"
+
+	// Routine context
+	routineapp "github.com/Bayar101/ray-backend/internal/routine/app"
+	routineinfra "github.com/Bayar101/ray-backend/internal/routine/infra"
+	routinetransport "github.com/Bayar101/ray-backend/internal/routine/transport"
+
+	// Finance context
+	financeapp "github.com/Bayar101/ray-backend/internal/finance/app"
+	financeinfra "github.com/Bayar101/ray-backend/internal/finance/infra"
+	financetransport "github.com/Bayar101/ray-backend/internal/finance/transport"
+
 	"github.com/go-playground/validator/v10"
 	"github.com/gofiber/fiber/v3"
 )
@@ -22,22 +31,29 @@ func main() {
 		log.Fatalf("config load failed: %v", err)
 	}
 
-	db, err := database.Connect(cfg.DB)
+	db, err := database.Connect(cfg.DB,
+		append(routineinfra.Models(), financeinfra.Models()...)...,
+	)
 	if err != nil {
 		log.Fatalf("database connection failed: %v", err)
 	}
 
-	svc := services.NewRoutineService(db)
-	handler := handlers.NewRoutineHandler(svc)
+	// routine context
+	routineRepo := routineinfra.NewGormRepository(db)
+	routineSvc := routineapp.NewService(routineRepo)
+	routineHTTP := routinetransport.NewHandler(routineSvc)
 
-	txSvc := services.NewTransactionService(db)
-	txHandler := handlers.NewTransactionHandler(txSvc)
+	// finance context
+	txRepo := financeinfra.NewTransactionGormRepository(db)
+	txCatRepo := financeinfra.NewTransactionCategoryGormRepository(db)
+	financeSvc := financeapp.NewService(txRepo, txCatRepo)
+	financeHTTP := financetransport.NewHandler(financeSvc)
 
 	app := fiber.New(fiber.Config{
 		StructValidator: structValidator{v: validator.New()},
 	})
 
-	routes.Register(app, handler, txHandler)
+	routes.Register(app, routineHTTP, financeHTTP)
 
 	log.Fatal(app.Listen(":" + cfg.App.Port))
 }

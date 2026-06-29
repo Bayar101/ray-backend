@@ -1,10 +1,12 @@
 package routes
 
 import (
+	"context"
 	"testing"
 
-	"github.com/Bayar101/ray-backend/internal/models"
-	"github.com/Bayar101/ray-backend/internal/services"
+	financeinfra "github.com/Bayar101/ray-backend/internal/finance/infra"
+	routineapp "github.com/Bayar101/ray-backend/internal/routine/app"
+	routineinfra "github.com/Bayar101/ray-backend/internal/routine/infra"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -14,7 +16,7 @@ func newTestDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AutoMigrate(models.AllModels()...); err != nil {
+	if err := db.AutoMigrate(append(routineinfra.Models(), financeinfra.Models()...)...); err != nil {
 		t.Fatal(err)
 	}
 	return db
@@ -32,8 +34,8 @@ func TestCreate(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			svc := services.NewRoutineService(newTestDB(t))
-			_, err := svc.Create(t.Context(), tt.input, "")
+			svc := routineapp.NewService(routineinfra.NewGormRepository(newTestDB(t)))
+			_, err := svc.Create(context.Background(), tt.input, "")
 
 			if tt.wantErr && err == nil {
 				t.Fatalf("want error, got nil")

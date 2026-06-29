@@ -1,372 +1,961 @@
-# Routine Tracker — Build Guide
+# Migrating ray-backend to Domain-Driven Design
 
-This guide builds the API step by step. **Every step has two parts:**
+This guide walks you through restructuring the project from its current **technical layering**
+(everything grouped by *what kind of code* it is — `models/`, `services/`, `handlers/`) into a
+**Domain-Driven Design** layout (everything grouped by *what part of the business* it serves —
+`routine/`, `finance/`).
 
-- **Simple implementation** — the smallest thing that works. This is what gets you running.
-- **Best practice** — how you'd write it for a real/production codebase, and *why*.
-
-Start with the simple version to learn the flow, then revisit the best-practice notes
-when hardening the project. Many best-practice items are optional for a learning project
-but expected in production.
-
----
-
-## Where we are
-
-```
-ray-backend/
-├── cmd/server/main.go          entrypoint
-├── internal/
-│   ├── config/config.go        viper config loader
-│   ├── models/base.go          base model (ID, timestamps, soft delete)
-│   ├── models/routine.go       Routine + RoutineLog structs
-│   ├── database/database.go    GORM + Postgres connection
-│   ├── handlers/               HTTP handlers
-│   ├── services/               business logic
-│   └── routes/                 route registration
-├── docker-compose.yml          Postgres container
-├── .env.example                DB + PORT vars
-├── config.yml                  committed defaults
-└── Makefile                    `make air`
-```
+It's written for *this* codebase. Every "before" snippet is real code from the repo today, and
+every "after" snippet is where that same code lands. You can follow it top to bottom and end with
+a working, refactored API — no rewrites from scratch.
 
 ---
 
-## Dev setup — Air live reload
+## Part 0 — What DDD actually is (and what it isn't)
 
-Install once:
+Domain-Driven Design is one core idea with some structure bolted on:
+
+> **The code should be organized around the business domain, and the rules of the business
+> should live in objects that model that business — not scattered across service functions
+> and database queries.**
+
+That's it. Everything below is mechanics in service of that sentence.
+
+Three things DDD asks of us that the current code doesn't do:
+
+1. **Model the domain with behavior, not just data.** Right now `models.Routine` is a bag of
+   fields with GORM tags. "Completing a routine" lives in `RoutineService.Complete`. In DDD,
+   *the routine knows how to be completed*. Logic moves onto the thing it's about.
+
+2. **Keep the domain ignorant of the database.** Today `RoutineService` holds a `*gorm.DB` and
+   calls `s.db.Create(...)` directly. The business logic and the persistence technology are welded
+   together. DDD splits them: the domain declares *what* it needs ("save this routine") as an
+   interface; a separate infrastructure layer says *how* (GORM + Postgres).
+
+3. **Draw boundaries around each part of the business.** Habits/routines and money/transactions
+   are two unrelated subjects that happen to share a database. DDD calls these **bounded
+   contexts** and gives each its own folder, its own models, its own language.
+
+### The dependency rule
+
+DDD layers are arranged so that **dependencies only ever point inward**:
+
+```
+   transport (HTTP)  ─┐
+   application        ─┼──►  domain   ◄── infrastructure (GORM)
+                       ┘
+```
+
+- **domain** — the center. Knows nothing about HTTP, GORM, Fiber, or Postgres. Pure Go + business rules.
+- **application** — orchestrates use cases ("create a routine, then log it"). Depends on domain only.
+- **infrastructure** — implements the interfaces the domain declares (the GORM repository). Depends on domain.
+- **transport** — translates HTTP ⇆ application calls (the Fiber handlers). Depends on application.
+
+The domain is the one thing nothing is allowed to corrupt. GORM tags, Fiber contexts, JSON tags —
+none of that leaks inward. That single rule is what makes a DDD codebase testable and durable.
+
+---
+
+## Where we are today
+
+```
+internal/
+├── config/         viper loader            (shared)
+├── database/       gorm + postgres connect (shared)
+├── models/
+│   ├── base.go     Base (id, timestamps, soft delete)
+│   ├── routine.go  Routine, RoutineLog
+│   ├── transaction.go  Transaction, TransactionCategory, TransactionType
+│   └── models.go   AllModels() registry
+├── services/
+│   ├── routine_service.go      business logic + SQL, holds *gorm.DB
+│   └── transaction_service.go  business logic + SQL, holds *gorm.DB
+├── handlers/
+│   ├── routine_handler.go      Fiber, DTOs, validation
+│   ├── transaction_handler.go
+│   └── validate.go             shared validator
+└── routes/
+    └── routes.go   wires handlers onto Fiber groups
+```
+
+**The smell:** to understand "routines" you open four folders. To add a feature you touch
+`models/`, `services/`, `handlers/`, `routes/`. The business concept is shredded across technical
+layers. And `Transaction` and `Routine` — which have nothing to do with each other — sit in the
+same packages, importable from each other with zero friction.
+
+---
+
+## Where we're going
+
+Group by **bounded context** first, then by **layer** inside each context:
+
+```
+internal/
+├── platform/                  shared, domain-agnostic plumbing
+│   ├── config/                (moved from internal/config)
+│   ├── database/              (moved from internal/database)
+│   └── httpx/                 shared HTTP helpers (error envelope, id parsing)
+│
+├── routine/                   ── BOUNDED CONTEXT: habit tracking ──
+│   ├── domain/
+│   │   ├── routine.go         Routine aggregate (entity + behavior + invariants)
+│   │   ├── log.go             RoutineLog entity
+│   │   ├── errors.go          ErrRoutineNotFound, ErrDuplicateName, ...
+│   │   └── repository.go      Repository interface (the PORT)
+│   ├── app/
+│   │   └── service.go         use cases: Create, Complete, DailyHistory, ...
+│   ├── infra/
+│   │   └── gorm_repository.go GORM implementation of domain.Repository
+│   └── transport/
+│       └── http.go            Fiber handler + DTOs for /api/routines
+│
+└── finance/                   ── BOUNDED CONTEXT: money ──
+    ├── domain/
+    │   ├── transaction.go     Transaction aggregate
+    │   ├── category.go        Category aggregate
+    │   ├── money.go           Money value object
+    │   ├── errors.go
+    │   └── repository.go      TransactionRepository, CategoryRepository
+    ├── app/
+    │   └── service.go
+    ├── infra/
+    │   └── gorm_repository.go
+    └── transport/
+        └── http.go            /api/transactions
+```
+
+Now "routines" is **one folder**. Everything about habit tracking — its rules, its storage, its
+HTTP surface — is in `internal/routine/`. Open it and the whole feature is in front of you.
+
+> **Naming the contexts.** I called the money context `finance` rather than `transaction` because
+> a bounded context is named after the *area of the business*, not one table. It will grow to hold
+> budgets, categories, reports — all "finance". This is the **ubiquitous language** in action:
+> name code the way the business talks about it.
+
+---
+
+## Step 1 — Carve out the platform (shared) layer
+
+Start with the easy, mechanical move so the harder steps have a clean base.
+
+`config` and `database` aren't part of any one domain — they're infrastructure every context uses.
+Move them under `platform/`:
 
 ```bash
-go install github.com/air-verse/air@latest
+mkdir -p internal/platform
+git mv internal/config   internal/platform/config
+git mv internal/database internal/platform/database
 ```
 
-`.air.toml`:
+Update imports (the module path is `github.com/Bayar101/ray-backend`):
 
-```toml
-root = "."
-tmp_dir = "tmp"
-
-[build]
-  bin = "./tmp/server"
-  cmd = "go build -o ./tmp/server ./cmd/server"
-  delay = 1000
-  include_ext = ["go", "yml", "yaml", "toml"]
-  exclude_dir = ["tmp", "vendor"]
-  kill_delay = "0s"
-
-[log]
-  time = true
+```go
+// before
+"github.com/Bayar101/ray-backend/internal/config"
+"github.com/Bayar101/ray-backend/internal/database"
+// after
+"github.com/Bayar101/ray-backend/internal/platform/config"
+"github.com/Bayar101/ray-backend/internal/platform/database"
 ```
 
-`Makefile` (real tab, not spaces):
+> **One catch with `database.Connect`.** Today it imports `internal/models` to call
+> `db.AutoMigrate(models.AllModels()...)`. That couples shared plumbing to a specific domain's
+> models — backwards under the dependency rule. We fix this in Step 6 by having each context
+> register its own models. For now leave it; we'll come back.
 
-```makefile
-.PHONY: air
-air:
-	air
-```
-
-Add `tmp/` to `.gitignore`. Then `make air` rebuilds + restarts on every save.
-
-> **Note:** `air` warns `build.bin is deprecated; set build.entrypoint instead` on newer
-> versions. Harmless — `bin` still works. To silence it, rename `bin` → `entrypoint`.
+Build to confirm nothing broke: `go build ./...`.
 
 ---
 
-## Step 1 — Models & foreign keys
+## Step 2 — Build the domain layer: entities with behavior
 
-`RoutineLog` belongs to a `Routine`. The link is a foreign key.
+This is the heart of the migration. We turn anemic data structs into a real domain model.
 
-### Simple implementation
+### Before — anemic model + logic in the service
 
-GORM infers the foreign key from the naming convention — a `uint` field named
-`RoutineID` is understood to point at `Routine`:
+```go
+// internal/models/routine.go
+type Routine struct {
+    Base
+    Name        string `gorm:"not null;uniqueIndex" json:"name"`
+    Description string `gorm:"type:text;" json:"description"`
+}
+
+// internal/services/routine_service.go — the rule lives HERE, not on the model
+func (s *RoutineService) Create(ctx context.Context, name, description string) (models.Routine, error) {
+    r := models.Routine{Name: name, Description: description}
+    if name == "" {
+        return models.Routine{}, fmt.Errorf("name is required")
+    }
+    ...
+}
+```
+
+The invariant "a routine must have a name" floats in a service method. Nothing stops some other
+code path from creating a nameless `Routine` directly.
+
+### After — the domain enforces its own rules
+
+`internal/routine/domain/routine.go`:
+
+```go
+package domain
+
+import "time"
+
+// Routine is the aggregate root for the habit-tracking context.
+// It carries no GORM tags and no JSON tags — the domain doesn't know those exist.
+type Routine struct {
+    id          uint
+    name        string
+    description string
+    createdAt   time.Time
+    updatedAt   time.Time
+}
+
+// NewRoutine is the only way to construct a valid Routine.
+// The invariant lives at the door: you cannot build an invalid one.
+func NewRoutine(name, description string) (*Routine, error) {
+    if name == "" {
+        return nil, ErrNameRequired
+    }
+    if len(name) > 100 {
+        return nil, ErrNameTooLong
+    }
+    return &Routine{name: name, description: description}, nil
+}
+
+// Rename is behavior on the entity, expressed in the ubiquitous language.
+func (r *Routine) Rename(name string) error {
+    if name == "" {
+        return ErrNameRequired
+    }
+    r.name = name
+    return nil
+}
+
+// Accessors — fields stay unexported so the invariants can't be bypassed.
+func (r *Routine) ID() uint            { return r.id }
+func (r *Routine) Name() string        { return r.name }
+func (r *Routine) Description() string { return r.description }
+
+// Hydrate rebuilds an entity from ALREADY-VALID stored data (used only by the
+// repository). It skips NewRoutine's checks — the row in the DB was valid when it
+// was written. This is the "rehydration" factory the infra layer needs.
+func Hydrate(id uint, name, description string) *Routine {
+    return &Routine{id: id, name: name, description: description}
+}
+```
+
+The `RoutineLog` entity and its completion behavior live in the same package
+(`internal/routine/domain/log.go` or alongside `routine.go`):
 
 ```go
 type RoutineLog struct {
+    id          uint
+    routineID   uint
+    completedAt time.Time
+}
+
+// LogCompletion is the domain expressing what "completing a routine" produces.
+func LogCompletion(r *Routine) *RoutineLog {
+    return &RoutineLog{routineID: r.ID(), completedAt: time.Now()}
+}
+
+// HydrateLog rebuilds a stored log (used by the repository).
+func HydrateLog(id, routineID uint, completedAt time.Time) *RoutineLog {
+    return &RoutineLog{id: id, routineID: routineID, completedAt: completedAt}
+}
+
+func (l *RoutineLog) ID() uint               { return l.id }
+func (l *RoutineLog) RoutineID() uint        { return l.routineID }
+func (l *RoutineLog) CompletedAt() time.Time { return l.completedAt }
+```
+
+> **Why `Hydrate` AND `NewRoutine`?** `NewRoutine` is for *new* routines from user input — it
+> validates. `Hydrate` is for routines coming *back from the database* — already valid, and it
+> must be able to set the `id` (which `NewRoutine` never does). Two constructors, two jobs.
+
+`internal/routine/domain/errors.go`:
+
+```go
+package domain
+
+import "errors"
+
+var (
+    ErrNameRequired    = errors.New("routine name is required")
+    ErrNameTooLong     = errors.New("routine name too long")
+    ErrRoutineNotFound = errors.New("routine not found")
+    ErrDuplicateName   = errors.New("routine name already exists")
+)
+```
+
+> **Why unexported fields?** If `name` is public, any package can write `r.Name = ""` and break the
+> invariant `NewRoutine` worked to guarantee. Hiding fields behind constructors and methods is how
+> the entity *stays* valid for its whole life. This is the single biggest behavioral change from
+> the anemic style.
+
+> **Note on the trade-off:** unexported fields mean GORM can't scan straight into the domain
+> struct, and `c.JSON(routine)` can't serialize it. That's not a bug — it's the boundary doing its
+> job. Step 4 (infrastructure) and Step 5 (transport) each keep their own struct and translate.
+> If that feels like too much ceremony for a small project, see the "Pragmatic dial" note at the end.
+
+---
+
+## Step 3 — Value objects: model concepts, not primitives
+
+A **value object** is a small immutable type defined by its value, with no identity. It replaces a
+naked primitive that's secretly carrying rules.
+
+The finance context has a perfect candidate: `Amount int64`. An amount of money isn't just a
+number — it can't be negative, it has a currency, it knows how to add. And `TransactionType` is
+already half a value object (it's a `string` enum) but nothing validates it.
+
+### Before
+
+```go
+// internal/models/transaction.go
+type Transaction struct {
     Base
-    RoutineID   uint      `gorm:"not null" json:"routine_id"`
-    CompletedAt time.Time `json:"completed_at"`
+    Amount int64           `gorm:"not null" json:"amount"`
+    Type   TransactionType `gorm:"not null;index;type:varchar(20)" json:"type"`
+    ...
 }
 ```
 
-> **Bug to avoid:** `gorm:"foreignKey:ID"` on a plain `uint` does nothing — that tag is for
-> *association fields* (a field whose type is another struct). On a `uint` column GORM
-> silently ignores it. Use `gorm:"not null"` and let the naming convention do the work.
+Validation that `Type` is `income`/`expense` lives in a *handler* tag
+(`validate:"oneof=income expense"`) — i.e. the rule is enforced at the HTTP edge, and the domain
+trusts whatever it's handed.
 
-### Best practice
-
-- **Add the association field** so you can preload the parent and let GORM enforce the
-  constraint:
-
-  ```go
-  type RoutineLog struct {
-      Base
-      RoutineID   uint      `gorm:"not null;index" json:"routine_id"`
-      Routine     Routine   `gorm:"constraint:OnDelete:CASCADE" json:"-"`
-      CompletedAt time.Time `gorm:"not null" json:"completed_at"`
-  }
-  ```
-
-  - `index` on `RoutineID` — every "logs for this routine" query filters on it; without an
-    index that's a full table scan.
-  - `constraint:OnDelete:CASCADE` — deleting a routine removes its logs at the DB level,
-    not just in Go.
-  - `json:"-"` hides the embedded struct from API responses unless you explicitly preload it.
-- **Be deliberate about soft delete.** `Base` includes `gorm.DeletedAt`, so `Delete` only
-  sets `deleted_at`; rows stay. Good for audit trails, but every query must account for it
-  (GORM does automatically). Know which behavior you want.
-
----
-
-## Step 2 — Config: config.yml + env overrides
-
-`config.yml` holds defaults; environment variables override them at runtime (Docker, CI,
-prod) without editing the file.
-
-### Simple implementation
+### After — `internal/finance/domain/money.go`
 
 ```go
-func Load() *Config {
-    viper.SetConfigFile("config.yml")
-    viper.AutomaticEnv()
-    viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+package domain
 
-    if err := viper.ReadInConfig(); err != nil {
-        log.Fatalf("config read error: %v", err)
-    }
+import "errors"
 
-    var cfg Config
-    if err := viper.Unmarshal(&cfg); err != nil {
-        log.Fatalf("config unmarshal error: %v", err)
+var ErrNegativeAmount = errors.New("amount cannot be negative")
+
+// Money is a value object: immutable, no identity, compared by value.
+// Stored as integer minor units (cents) to dodge float rounding.
+type Money struct {
+    cents int64
+}
+
+func NewMoney(cents int64) (Money, error) {
+    if cents < 0 {
+        return Money{}, ErrNegativeAmount
     }
-    return &cfg
+    return Money{cents: cents}, nil
+}
+
+func (m Money) Cents() int64 { return m.cents }
+func (m Money) Add(o Money) Money { return Money{cents: m.cents + o.cents} }
+```
+
+And `TransactionType` becomes a self-validating value object:
+
+```go
+type TransactionType string
+
+const (
+    Income  TransactionType = "income"
+    Expense TransactionType = "expense"
+)
+
+func (t TransactionType) Valid() bool {
+    return t == Income || t == Expense
 }
 ```
 
-`AutomaticEnv` + the `.`→`_` replacer means viper checks `DB_HOST` for `db.host`,
-`APP_PORT` for `app.port`, etc. Precedence (high→low): **env var > config.yml > defaults**.
-Viper does **not** read `.env` itself — a tool (air, your shell, docker compose) loads
-`.env` into the environment first.
-
-### Best practice
-
-- **Return an error instead of `log.Fatal`.** A config loader is library code — let
-  `main` decide to exit. `log.Fatal` mid-package kills testability:
-
-  ```go
-  func Load() (*Config, error) {
-      ...
-      if err := viper.ReadInConfig(); err != nil {
-          return nil, fmt.Errorf("read config: %w", err)
-      }
-      ...
-      return &cfg, nil
-  }
-  ```
-
-- **Set defaults in code,** so the app still boots if `config.yml` is missing:
-  `viper.SetDefault("app.port", "8080")`.
-- **Validate required values** after unmarshal (e.g. DB host/user non-empty) and fail
-  fast with a clear message — beats a cryptic connection error later.
-- **Never commit real secrets** to `config.yml` (it's tracked). It currently has
-  `password: ray` — fine only because that's a throwaway local password. Real secrets go
-  in `.env` (gitignored) or a secrets manager.
-- **`SetEnvPrefix("RAY")`** to namespace your vars (`RAY_DB_HOST`) and avoid collisions
-  with unrelated environment variables on the host.
+Now the rule "type must be income or expense" lives in the domain and is true *everywhere* —
+not only when a request happens to pass through the validator. The handler tag becomes a
+convenience (fail fast with a nice 400), not the sole guardian.
 
 ---
 
-## Step 3 — Connect to Postgres & migrate
+## Step 4 — Repositories: invert the database dependency
 
-Open the connection once at startup; share the `*gorm.DB` (it's a connection pool)
-everywhere. Never call `gorm.Open` inside a request handler or service method.
+This is the structural change that frees the domain from GORM.
 
-### Simple implementation
+### Before — service is welded to GORM
 
 ```go
-func Connect(cfg config.DB) (*gorm.DB, error) {
-    db, err := gorm.Open(postgres.Open(cfg.DSN()))
+// internal/services/routine_service.go
+type RoutineService struct {
+    db *gorm.DB   // <-- domain logic holds a database handle
+}
+
+func (s *RoutineService) Get(ctx context.Context, id uint) (models.Routine, error) {
+    var routine models.Routine
+    if err := s.db.WithContext(ctx).First(&routine, id).Error; err != nil {
+        return models.Routine{}, fmt.Errorf("failed to get routine: %w", err)
+    }
+    return routine, nil
+}
+```
+
+You can't test this without a database, and `gorm.ErrRecordNotFound` leaks all the way out.
+
+### After — the domain declares a port
+
+`internal/routine/domain/repository.go`:
+
+```go
+package domain
+
+import (
+    "context"
+    "time"
+)
+
+// DailyEntry is a READ MODEL (a query projection), not an aggregate. Query-side
+// results are allowed to be plain data — they never get mutated or persisted, so
+// they don't need behavior or unexported fields. Field names map to the SELECT
+// columns by GORM's snake_case convention.
+type DailyEntry struct {
+    RoutineID   uint   `json:"id"`
+    Name        string `json:"name"`
+    Description string `json:"description"`
+    Completed   bool   `json:"completed"`
+}
+
+// Repository is a PORT: the domain says WHAT it needs, not HOW.
+// No gorm, no sql — just the domain's own types.
+type Repository interface {
+    Save(ctx context.Context, r *Routine) error
+    FindByID(ctx context.Context, id uint) (*Routine, error)
+    FindAll(ctx context.Context) ([]*Routine, error)
+    Delete(ctx context.Context, id uint) error
+
+    AddLog(ctx context.Context, log *RoutineLog) error
+    DailyHistory(ctx context.Context, day time.Time) ([]DailyEntry, error)
+}
+```
+
+The infrastructure layer provides the adapter — **the full file**, so `GormRepository` actually
+satisfies the interface above. `internal/routine/infra/gorm_repository.go`:
+
+```go
+package infra
+
+import (
+    "context"
+    "errors"
+    "time"
+
+    "github.com/Bayar101/ray-backend/internal/routine/domain"
+    "gorm.io/gorm"
+)
+
+// ---- persistence models: GORM tags live HERE, never on the domain entity ----
+
+type routineRecord struct {
+    ID          uint           `gorm:"primaryKey"`
+    Name        string         `gorm:"not null;uniqueIndex"`
+    Description string         `gorm:"type:text"`
+    CreatedAt   time.Time      `gorm:"autoCreateTime"`
+    UpdatedAt   time.Time      `gorm:"autoUpdateTime"`
+    DeletedAt   gorm.DeletedAt `gorm:"index"`
+}
+
+func (routineRecord) TableName() string { return "routines" }
+
+type routineLogRecord struct {
+    ID          uint           `gorm:"primaryKey"`
+    RoutineID   uint           `gorm:"not null;index"`
+    CompletedAt time.Time      `gorm:"autoCreateTime"`
+    CreatedAt   time.Time      `gorm:"autoCreateTime"`
+    UpdatedAt   time.Time      `gorm:"autoUpdateTime"`
+    DeletedAt   gorm.DeletedAt `gorm:"index"`
+}
+
+func (routineLogRecord) TableName() string { return "routine_logs" }
+
+// Models is what the composition root registers for AutoMigrate (see Step 7).
+func Models() []any { return []any{&routineRecord{}, &routineLogRecord{}} }
+
+// ---- mappers: the translation between the two shapes ----
+
+func toDomain(rec routineRecord) *domain.Routine {
+    return domain.Hydrate(rec.ID, rec.Name, rec.Description)
+}
+
+func toRecord(r *domain.Routine) routineRecord {
+    return routineRecord{ID: r.ID(), Name: r.Name(), Description: r.Description()}
+}
+
+// ---- the repository ----
+
+type GormRepository struct{ db *gorm.DB }
+
+func NewGormRepository(db *gorm.DB) *GormRepository { return &GormRepository{db: db} }
+
+func (r *GormRepository) Save(ctx context.Context, ro *domain.Routine) error {
+    rec := toRecord(ro)
+    if err := r.db.WithContext(ctx).Save(&rec).Error; err != nil {
+        return err
+    }
+    *ro = *toDomain(rec) // copy back the DB-generated ID into the caller's entity
+    return nil
+}
+
+func (r *GormRepository) FindByID(ctx context.Context, id uint) (*domain.Routine, error) {
+    var rec routineRecord
+    if err := r.db.WithContext(ctx).First(&rec, id).Error; err != nil {
+        if errors.Is(err, gorm.ErrRecordNotFound) {
+            return nil, domain.ErrRoutineNotFound // translate infra error to DOMAIN error
+        }
+        return nil, err
+    }
+    return toDomain(rec), nil
+}
+
+func (r *GormRepository) FindAll(ctx context.Context) ([]*domain.Routine, error) {
+    var recs []routineRecord
+    if err := r.db.WithContext(ctx).Find(&recs).Error; err != nil {
+        return nil, err
+    }
+    out := make([]*domain.Routine, len(recs))
+    for i, rec := range recs {
+        out[i] = toDomain(rec)
+    }
+    return out, nil
+}
+
+func (r *GormRepository) Delete(ctx context.Context, id uint) error {
+    res := r.db.WithContext(ctx).Delete(&routineRecord{}, id)
+    if res.Error != nil {
+        return res.Error
+    }
+    if res.RowsAffected == 0 {
+        return domain.ErrRoutineNotFound
+    }
+    return nil
+}
+
+func (r *GormRepository) AddLog(ctx context.Context, log *domain.RoutineLog) error {
+    rec := routineLogRecord{RoutineID: log.RoutineID(), CompletedAt: log.CompletedAt()}
+    if err := r.db.WithContext(ctx).Create(&rec).Error; err != nil {
+        return err
+    }
+    *log = *domain.HydrateLog(rec.ID, rec.RoutineID, rec.CompletedAt)
+    return nil
+}
+
+func (r *GormRepository) DailyHistory(ctx context.Context, day time.Time) ([]domain.DailyEntry, error) {
+    start := time.Date(day.Year(), day.Month(), day.Day(), 0, 0, 0, 0, time.UTC)
+    end := start.Add(24 * time.Hour)
+
+    var entries []domain.DailyEntry
+    err := r.db.WithContext(ctx).
+        Model(&routineRecord{}).
+        Select("routines.id AS routine_id, routines.name, routines.description, COUNT(routine_logs.id) > 0 AS completed").
+        Joins(`LEFT JOIN routine_logs
+            ON routine_logs.routine_id = routines.id
+            AND routine_logs.completed_at >= ?
+            AND routine_logs.completed_at < ?
+            AND routine_logs.deleted_at IS NULL`, start, end).
+        Group("routines.id").
+        Scan(&entries).Error
     if err != nil {
         return nil, err
     }
-    db.AutoMigrate(&models.Routine{}, &models.RoutineLog{})
-    return db, nil
+    return entries, nil
 }
 ```
 
-`AutoMigrate` reads the structs and creates/updates matching tables. It only **adds**
-tables/columns/indexes — it never drops or alters existing columns.
+Two payoffs:
 
-### Best practice
+- **`domain.ErrRoutineNotFound` replaces `gorm.ErrRecordNotFound`.** The leak is plugged at the
+  one place that knows about GORM. Everything above just checks the domain error.
+- **The app layer depends on `domain.Repository`, an interface.** In tests you pass a fake
+  in-memory implementation — no SQLite, no Docker. The GORM version is just one adapter.
 
-- **Capture the migrate error.** The simple version ignores it — a failed migration goes
-  unnoticed until queries break:
-
-  ```go
-  if err := db.AutoMigrate(models.AllModels()...); err != nil {
-      return nil, fmt.Errorf("automigrate: %w", err)
-  }
-  ```
-
-- **Central model registry** instead of listing models inline. With 30 models you don't
-  edit `database.go` every time — GORM has no auto-discovery, so each model *must* be
-  listed somewhere:
-
-  ```go
-  // internal/models/models.go
-  func AllModels() []any {
-      return []any{
-          &Routine{},     // parents first...
-          &RoutineLog{},  // ...children after (FK target must exist)
-      }
-  }
-  ```
-
-  Order matters: a model with a foreign key must come **after** the model it references,
-  or GORM may fail creating the constraint.
-- **Configure the connection pool** — defaults are unbounded and will exhaust Postgres
-  under load:
-
-  ```go
-  sqlDB, _ := db.DB()
-  sqlDB.SetMaxOpenConns(25)
-  sqlDB.SetMaxIdleConns(5)
-  sqlDB.SetConnMaxLifetime(time.Hour)
-  ```
-
-- **Tune the GORM logger** (`logger.Default.LogMode(logger.Warn)`) so dev logs aren't
-  drowned in every SQL statement; raise to `Info` when debugging queries.
-- **Don't `AutoMigrate` in production.** It can't express renames, data backfills, or safe
-  column drops, and running schema changes automatically on every deploy is risky. Graduate
-  to versioned migration files ([`golang-migrate`](https://github.com/golang-migrate/migrate)
-  or [`goose`](https://github.com/pressly/goose)); keep `AutoMigrate` for local/dev only.
+> **The `*ro = *toDomain(rec)` trick.** `Save` must return the DB-generated `id` to the caller,
+> but the domain's `id` field is unexported — infra (a different package) can't write it directly.
+> The fix: build a fresh entity via `Hydrate` (which *can* set `id`, same package as the field) and
+> copy the whole struct over the caller's pointer. Struct assignment copies every field, exported or
+> not. This is why the `Hydrate` factory from Step 2 isn't optional — `Save` and `AddLog` both need it.
 
 ---
 
-## Step 4 — Service layer
+## Step 5 — Application layer: thin use-case orchestration
 
-Services hold business logic. They know the database; they know nothing about HTTP.
+The application service replaces the old fat service. It coordinates the domain and the repository
+but contains no business rules itself and no SQL.
 
-### Simple implementation
+`internal/routine/app/service.go`:
 
-```go
-type RoutineService struct {
-    db *gorm.DB
-}
-
-func NewRoutineService(db *gorm.DB) *RoutineService {
-    return &RoutineService{db: db}
-}
-
-func (s *RoutineService) Create(name, description string) (models.Routine, error) {
-    r := models.Routine{Name: name, Description: description}
-    res := s.db.Create(&r)
-    return r, res.Error
-}
-```
-
-Methods to implement: `Create`, `List`, `Get`, `Complete`, `DailyHistory`.
-
-**GORM ↔ SQL cheat sheet:**
-
-| Want | GORM | SQL |
-|------|------|-----|
-| Insert | `db.Create(&t)` | `INSERT` |
-| All rows | `db.Find(&ts)` | `SELECT *` |
-| One by ID | `db.First(&t, id)` | `SELECT … WHERE id=? LIMIT 1` |
-| Filter | `db.Where("x = ?", v).Find(&ts)` | `WHERE x = ?` |
-| Count | `db.Model(&T{}).Where(…).Count(&n)` | `SELECT COUNT(*)` |
-
-### Best practice
-
-- **Take `context.Context` as the first parameter** and pass it to GORM with
-  `WithContext` — enables request cancellation and per-request timeouts:
-
-  ```go
-  func (s *RoutineService) Create(ctx context.Context, name, desc string) (models.Routine, error) {
-      r := models.Routine{Name: name, Description: desc}
-      res := s.db.WithContext(ctx).Create(&r)
-      return r, res.Error
-  }
-  ```
-
-- **Avoid N+1 queries in `DailyHistory`.** The naive version loops over routines and runs
-  a count query per routine — 1 + N queries. For N routines that's death by round-trips.
-  Do it in one query with a `LEFT JOIN` / `GROUP BY`, or fetch all of the day's logs once
-  and match in Go.
-- **Wrap writes that touch multiple tables in a transaction** (`s.db.Transaction(func(tx *gorm.DB) error { … })`)
-  so a partial failure rolls back.
-- **Depend on an interface, not `*gorm.DB`,** at the boundaries you want to test — lets you
-  swap a mock. (For this size, a real in-memory SQLite DB in tests is simpler — see Step 8.)
-- **Wrap errors with context:** `fmt.Errorf("create routine: %w", err)` so logs say *what*
-  failed, not just `record not found`.
-
----
-
-## Step 5 — Handlers
-
-Handlers are the HTTP boundary. Each does exactly three things: parse the request, call a
-service, return JSON. **No business logic, no SQL, no date math here** — push that into the
-service.
-
-### Simple implementation
+`internal/routine/app/service.go` — **every** use case the handler will call, so the transport
+layer in Step 6 has a method for each route:
 
 ```go
-func (h *RoutineHandler) Create(c fiber.Ctx) error {
-    var in struct {
-        Name        string `json:"name"`
-        Description string `json:"description"`
+package app
+
+import (
+    "context"
+    "time"
+
+    "github.com/Bayar101/ray-backend/internal/routine/domain"
+)
+
+type Service struct {
+    repo domain.Repository // depends on the PORT, not *gorm.DB
+}
+
+func NewService(repo domain.Repository) *Service { return &Service{repo: repo} }
+
+func (s *Service) Create(ctx context.Context, name, description string) (*domain.Routine, error) {
+    r, err := domain.NewRoutine(name, description) // domain enforces the invariant
+    if err != nil {
+        return nil, err
     }
+    if err := s.repo.Save(ctx, r); err != nil { // infra persists it
+        return nil, err
+    }
+    return r, nil
+}
+
+func (s *Service) List(ctx context.Context) ([]*domain.Routine, error) {
+    return s.repo.FindAll(ctx)
+}
+
+func (s *Service) Get(ctx context.Context, id uint) (*domain.Routine, error) {
+    return s.repo.FindByID(ctx, id)
+}
+
+func (s *Service) Update(ctx context.Context, id uint, name, description string) (*domain.Routine, error) {
+    r, err := s.repo.FindByID(ctx, id)
+    if err != nil {
+        return nil, err
+    }
+    if name != "" {
+        if err := r.Rename(name); err != nil { // mutate THROUGH the entity's behavior
+            return nil, err
+        }
+    }
+    if description != "" {
+        r.Describe(description)
+    }
+    if err := s.repo.Save(ctx, r); err != nil {
+        return nil, err
+    }
+    return r, nil
+}
+
+func (s *Service) Delete(ctx context.Context, id uint) error {
+    return s.repo.Delete(ctx, id)
+}
+
+// Complete is a use case spanning two entities — orchestration belongs here.
+func (s *Service) Complete(ctx context.Context, id uint) (*domain.RoutineLog, error) {
+    r, err := s.repo.FindByID(ctx, id)
+    if err != nil {
+        return nil, err // already domain.ErrRoutineNotFound from the repo
+    }
+    log := domain.LogCompletion(r) // domain decides what "completing" means
+    if err := s.repo.AddLog(ctx, log); err != nil {
+        return nil, err
+    }
+    return log, nil
+}
+
+func (s *Service) DailyHistory(ctx context.Context, day time.Time) ([]domain.DailyEntry, error) {
+    return s.repo.DailyHistory(ctx, day)
+}
+```
+
+`Update` calls `r.Rename(...)` — that's the partial-update logic from the old
+`RoutineService.Update`, but now the *entity* owns the rule. Add the matching `Describe` mutator
+to the domain entity (Step 2), since description has no invariant it's a plain setter:
+
+```go
+func (r *Routine) Describe(description string) { r.description = description }
+```
+
+Compare to the old `RoutineService.Complete` (which did the `First`, built the `RoutineLog`, and
+called `Create` all against `s.db`). Same steps — but now "what completing means" is a domain call
+and "how it's stored" is behind the repo. The use case reads like the business sentence.
+
+---
+
+## Step 6 — Transport layer: HTTP stays at the edge
+
+The Fiber handler keeps doing exactly what `routine_handler.go` does today — parse, validate, call,
+respond — but it calls the **app service** and maps **domain errors** to status codes.
+
+`internal/routine/transport/http.go` — **the whole file**, including `Register` and every route
+handler (the old `routine_handler.go` had eight; they all come across):
+
+```go
+package transport
+
+import (
+    "errors"
+    "strconv"
+    "time"
+
+    "github.com/Bayar101/ray-backend/internal/routine/app"
+    "github.com/Bayar101/ray-backend/internal/routine/domain"
+    "github.com/gofiber/fiber/v3"
+)
+
+type Handler struct{ svc *app.Service }
+
+func NewHandler(svc *app.Service) *Handler { return &Handler{svc: svc} }
+
+func (h *Handler) Register(rg fiber.Router) {
+    rg.Post("/create", h.Create)
+    rg.Get("/list", h.List)
+    rg.Get("/get/:id", h.Get)
+    rg.Put("/update/:id", h.Update)
+    rg.Delete("/delete/:id", h.Delete)
+    rg.Post("/complete/:id", h.Complete)
+    rg.Get("/history", h.DailyHistory)
+}
+
+// DTOs stay here — JSON tags belong to transport, not the domain.
+type createInput struct {
+    Name        string `json:"name" validate:"required,min=1,max=100"`
+    Description string `json:"description" validate:"max=1000"`
+}
+
+type updateInput struct {
+    Name        string `json:"name" validate:"omitempty,min=1,max=100"`
+    Description string `json:"description" validate:"omitempty,max=1000"`
+}
+
+type routineResponse struct {
+    ID          uint   `json:"id"`
+    Name        string `json:"name"`
+    Description string `json:"description"`
+}
+
+func toResponse(r *domain.Routine) routineResponse {
+    return routineResponse{ID: r.ID(), Name: r.Name(), Description: r.Description()}
+}
+
+func (h *Handler) Create(c fiber.Ctx) error {
+    var in createInput
     if err := c.Bind().Body(&in); err != nil {
         return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
     }
-    r, err := h.svc.Create(in.Name, in.Description)
+    r, err := h.svc.Create(c.Context(), in.Name, in.Description)
     if err != nil {
-        return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+        return mapError(c, err)
     }
-    return c.Status(fiber.StatusCreated).JSON(r)
+    return c.Status(fiber.StatusCreated).JSON(toResponse(r))
+}
+
+func (h *Handler) List(c fiber.Ctx) error {
+    routines, err := h.svc.List(c.Context())
+    if err != nil {
+        return mapError(c, err)
+    }
+    out := make([]routineResponse, len(routines))
+    for i, r := range routines {
+        out[i] = toResponse(r)
+    }
+    return c.Status(fiber.StatusOK).JSON(out)
+}
+
+func (h *Handler) Get(c fiber.Ctx) error {
+    id, err := strconv.Atoi(c.Params("id"))
+    if err != nil {
+        return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid id"})
+    }
+    r, err := h.svc.Get(c.Context(), uint(id))
+    if err != nil {
+        return mapError(c, err)
+    }
+    return c.Status(fiber.StatusOK).JSON(toResponse(r))
+}
+
+func (h *Handler) Update(c fiber.Ctx) error {
+    id, err := strconv.Atoi(c.Params("id"))
+    if err != nil {
+        return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid id"})
+    }
+    var in updateInput
+    if err := c.Bind().Body(&in); err != nil {
+        return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
+    }
+    r, err := h.svc.Update(c.Context(), uint(id), in.Name, in.Description)
+    if err != nil {
+        return mapError(c, err)
+    }
+    return c.Status(fiber.StatusOK).JSON(toResponse(r))
+}
+
+func (h *Handler) Delete(c fiber.Ctx) error {
+    id, err := strconv.Atoi(c.Params("id"))
+    if err != nil {
+        return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid id"})
+    }
+    if err := h.svc.Delete(c.Context(), uint(id)); err != nil {
+        return mapError(c, err)
+    }
+    return c.Status(fiber.StatusOK).JSON(fiber.Map{"message": "routine deleted"})
+}
+
+func (h *Handler) Complete(c fiber.Ctx) error {
+    id, err := strconv.Atoi(c.Params("id"))
+    if err != nil {
+        return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid id"})
+    }
+    log, err := h.svc.Complete(c.Context(), uint(id))
+    if err != nil {
+        return mapError(c, err)
+    }
+    return c.Status(fiber.StatusCreated).JSON(fiber.Map{
+        "id": log.ID(), "routine_id": log.RoutineID(), "completed_at": log.CompletedAt(),
+    })
+}
+
+func (h *Handler) DailyHistory(c fiber.Ctx) error {
+    dateStr := c.Query("date")
+    if dateStr == "" {
+        dateStr = time.Now().Format("2006-01-02")
+    }
+    day, err := time.Parse("2006-01-02", dateStr)
+    if err != nil {
+        return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid date"})
+    }
+    entries, err := h.svc.DailyHistory(c.Context(), day)
+    if err != nil {
+        return mapError(c, err)
+    }
+    return c.Status(fiber.StatusOK).JSON(entries)
+}
+
+// mapError is the single place domain errors become HTTP status codes.
+func mapError(c fiber.Ctx, err error) error {
+    switch {
+    case errors.Is(err, domain.ErrRoutineNotFound):
+        return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "routine not found"})
+    case errors.Is(err, domain.ErrDuplicateName):
+        return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "routine name already exists"})
+    case errors.Is(err, domain.ErrNameRequired), errors.Is(err, domain.ErrNameTooLong):
+        return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+    default:
+        return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "internal error"})
+    }
 }
 ```
 
-Input parsing patterns:
+Notice the old handler scattered `errors.Is(err, gorm.ErrRecordNotFound)` across five methods. Now
+there's **one** `mapError`, and it speaks the domain's language, not GORM's. The `default` case also
+stops leaking raw `err.Error()` (which today exposes SQL details) — a security win that fell out of
+the restructure for free.
 
-```go
-id, err := strconv.Atoi(c.Params("id"))      // URL param  /api/routines/:id
-date, err := time.Parse("2006-01-02", c.Query("date"))  // query  ?date=2026-06-12
-```
-
-### Best practice
-
-- **Validate input,** don't just bind it. Empty `name`, negative id, bad date → return
-  `400` with a specific message *before* calling the service. A validation library like
-  [`go-playground/validator`](https://github.com/go-playground/validator) with struct tags
-  (`validate:"required,min=1"`) scales better than hand-written `if`s.
-- **Don't leak internal errors to clients.** `err.Error()` can expose SQL/schema details.
-  Log the real error server-side; return a generic message + a request ID to the client.
-- **Map errors to correct status codes.** `gorm.ErrRecordNotFound` → `404`, not `500`:
-
-  ```go
-  if errors.Is(err, gorm.ErrRecordNotFound) {
-      return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "routine not found"})
-  }
-  ```
-
-- **Consistent error envelope** across all handlers (e.g. always `{"error": "..."}` or a
-  richer `{"error": {"code": "...", "message": "..."}}`) so the frontend can rely on one shape.
-- **Named request/response DTO types** instead of anonymous structs once they repeat —
-  easier to document and reuse.
+> `Register(rg fiber.Router)` keeps the same shape the old handler had — that pattern was already
+> clean and survives the migration untouched. The validation tags (`validate:"required,..."`) still
+> fire via Fiber's `StructValidator` (wired in `main.go`) before the service is called.
 
 ---
 
-## Step 6 — Routes & middleware
+## Step 7 — Composition root: wire it in `main.go`
 
-Middleware runs before every handler, top to bottom.
+The dependency graph is now explicit and points inward. `main` is the **composition root** — the
+one place allowed to know about every layer, where you plug the concrete adapters into the ports.
 
-### Simple implementation
+### Before
 
 ```go
-func Register(app *fiber.App, h *handlers.RoutineHandler) {
+svc := services.NewRoutineService(db)
+handler := handlers.NewRoutineHandler(svc)
+txSvc := services.NewTransactionService(db)
+txHandler := handlers.NewTransactionHandler(txSvc)
+```
+
+### After
+
+> **This is where your build broke.** `main.go` references `routineinfra`, `routineapp`, etc. —
+> but every one of those packages is literally named `package infra` / `package app` /
+> `package transport`. Three contexts × three layers would give you six packages all called `app`
+> and `infra`, which won't compile. The fix is **named imports (aliases)** — give each import path a
+> unique local name. The aliases aren't magic identifiers; they're declared in the import block:
+
+```go
+package main
+
+import (
+    "log"
+
+    "github.com/Bayar101/ray-backend/internal/platform/config"
+    "github.com/Bayar101/ray-backend/internal/platform/database"
+    "github.com/Bayar101/ray-backend/internal/routes"
+
+    // routine context — alias each layer so the names in main() resolve
+    routineapp "github.com/Bayar101/ray-backend/internal/routine/app"
+    routineinfra "github.com/Bayar101/ray-backend/internal/routine/infra"
+    routinetransport "github.com/Bayar101/ray-backend/internal/routine/transport"
+
+    // finance context
+    financeapp "github.com/Bayar101/ray-backend/internal/finance/app"
+    financeinfra "github.com/Bayar101/ray-backend/internal/finance/infra"
+    financetransport "github.com/Bayar101/ray-backend/internal/finance/transport"
+
+    "github.com/go-playground/validator/v10"
+    "github.com/gofiber/fiber/v3"
+)
+
+type structValidator struct{ v *validator.Validate }
+
+func (s structValidator) Validate(out any) error { return s.v.Struct(out) }
+
+func main() {
+    cfg, err := config.Load()
+    if err != nil {
+        log.Fatalf("config load failed: %v", err)
+    }
+
+    db, err := database.Connect(cfg.DB)
+    if err != nil {
+        log.Fatalf("database connection failed: %v", err)
+    }
+
+    // routine context
+    routineRepo := routineinfra.NewGormRepository(db) // infra adapter (implements domain.Repository)
+    routineSvc := routineapp.NewService(routineRepo)  // app layer depends on the interface
+    routineHTTP := routinetransport.NewHandler(routineSvc)
+
+    // finance context
+    financeRepo := financeinfra.NewGormRepository(db)
+    financeSvc := financeapp.NewService(financeRepo)
+    financeHTTP := financetransport.NewHandler(financeSvc)
+
+    app := fiber.New(fiber.Config{
+        StructValidator: structValidator{v: validator.New()},
+    })
+
+    routes.Register(app, routineHTTP, financeHTTP)
+
+    log.Fatal(app.Listen(":" + cfg.App.Port))
+}
+```
+
+Read the routine block top to bottom: GORM adapter → into the app service (as an interface) →
+into the handler. The arrows of the dependency rule, written out as constructor calls.
+
+`routes.Register` changes signature — it now takes the two **transport** handlers instead of the
+old `*handlers.RoutineHandler`. `internal/routes/routes.go`:
+
+```go
+package routes
+
+import (
+    financetransport "github.com/Bayar101/ray-backend/internal/finance/transport"
+    routinetransport "github.com/Bayar101/ray-backend/internal/routine/transport"
+    "github.com/gofiber/fiber/v3"
+    "github.com/gofiber/fiber/v3/middleware/cors"
+    "github.com/gofiber/fiber/v3/middleware/logger"
+    "github.com/gofiber/fiber/v3/middleware/recover"
+)
+
+func Register(app *fiber.App, rh *routinetransport.Handler, fh *financetransport.Handler) {
     app.Use(logger.New())
     app.Use(recover.New())
     app.Use(cors.New())
@@ -374,834 +963,613 @@ func Register(app *fiber.App, h *handlers.RoutineHandler) {
     app.Get("/health", func(c fiber.Ctx) error { return c.SendString("ok") })
 
     api := app.Group("/api")
-    api.Post("/routines", h.Create)
-    api.Get("/routines", h.List)
-    api.Get("/routines/:id", h.Get)
-    api.Post("/routines/:id/complete", h.Complete)
-    api.Get("/history", h.DailyHistory)
+    rh.Register(api.Group("/routines"))
+    fh.Register(api.Group("/transactions"))
 }
 ```
 
-- `logger.New()` — logs each request
-- `recover.New()` — catches panics so one bad handler doesn't crash the server
-- `cors.New()` — lets the frontend (different origin) call the API
-
-### Best practice
-
-- **Lock down CORS.** `cors.New()` with defaults allows all origins — fine for local dev,
-  unsafe in production. Set an explicit allow-list:
-
-  ```go
-  app.Use(cors.New(cors.Config{
-      AllowOrigins: []string{"https://app.example.com"},
-      AllowMethods: []string{"GET", "POST"},
-  }))
-  ```
-
-- **Version the API:** `app.Group("/api/v1")`. Lets you ship breaking changes under `/v2`
-  without breaking existing clients.
-- **Split liveness from readiness.** `/health` ("process is up") vs `/ready` ("DB is
-  reachable", pinging `sqlDB.Ping()`). Orchestrators (k8s, compose healthchecks) use them
-  differently.
-- **Add a request-timeout middleware** so a slow query can't hold a connection forever, and
-  a **request-ID** middleware so logs and client errors can be correlated.
-
----
-
-## Step 7 — Wire everything in main.go
-
-### Simple implementation
+**The migration registry** (the Step 1 loose end): instead of `models.AllModels()`, each context
+exposes the records *it* owns. The cleanest place to gather them is `database.Connect`, but that
+would make `platform/database` import both contexts — the backwards dependency we wanted to avoid.
+So pass the model list *in* as an argument instead. Change `Connect` to accept it:
 
 ```go
-func main() {
-    cfg := config.Load()
-
-    db, err := database.Connect(cfg.DB)
+// internal/platform/database/database.go
+func Connect(cfg config.DB, models ...any) (*gorm.DB, error) {
+    db, err := gorm.Open(postgres.Open(cfg.DSN()))
     if err != nil {
-        log.Fatalf("database connection failed: %v", err)
+        return nil, err
     }
-
-    svc := services.NewRoutineService(db)
-    handler := handlers.NewRoutineHandler(svc)
-
-    app := fiber.New()
-    routes.Register(app, handler)
-
-    log.Fatal(app.Listen(":" + cfg.App.Port))
+    if err := db.AutoMigrate(models...); err != nil {
+        return nil, err
+    }
+    // ... pool config unchanged
+    return db, nil
 }
 ```
 
-Order: load config → connect DB (fatal on error) → build service → build handler →
-create app → register routes → listen.
-
-### Best practice
-
-- **Extract a `run() error`** and keep `main` tiny. `log.Fatal` skips deferred cleanup
-  (`defer` doesn't run on `os.Exit`); returning an error lets you close resources first:
-
-  ```go
-  func main() {
-      if err := run(); err != nil {
-          log.Fatal(err)
-      }
-  }
-  ```
-
-- **Graceful shutdown.** Listen for `SIGINT`/`SIGTERM`, then `app.Shutdown()` so in-flight
-  requests finish and the DB pool closes cleanly instead of dropping connections:
-
-  ```go
-  go func() { _ = app.Listen(":" + cfg.App.Port) }()
-  quit := make(chan os.Signal, 1)
-  signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
-  <-quit
-  _ = app.ShutdownWithTimeout(10 * time.Second)
-  ```
-
-- **Use a structured logger** (`log/slog`) instead of the standard `log`, so production
-  logs are queryable JSON.
-
----
-
-## Step 8 — Tests
-
-Go's standard `testing` package needs no extra libraries.
-
-### Simple implementation
-
-Test the service against an **in-memory SQLite** DB — no Docker needed:
-
-```bash
-go get gorm.io/driver/sqlite
-```
+Then `main` gathers them — `main` is allowed to import every context, that's its whole job:
 
 ```go
-func newTestDB(t *testing.T) *gorm.DB {
-    db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
-    if err != nil { t.Fatal(err) }
-    if err := db.AutoMigrate(models.AllModels()...); err != nil { t.Fatal(err) }
-    return db
-}
-
-func TestCreate(t *testing.T) {
-    svc := services.NewRoutineService(newTestDB(t))
-    r, err := svc.Create("Morning run", "")
-    if err != nil { t.Fatal(err) }
-    if r.ID == 0 { t.Fatal("expected ID to be set") }
-}
+db, err := database.Connect(cfg.DB,
+    append(routineinfra.Models(), financeinfra.Models()...)...,
+)
 ```
 
-```bash
-go test ./...
-```
-
-### Best practice
-
-- **Table-driven tests** for multiple cases in one function (clearer than copy-paste):
-
-  ```go
-  tests := []struct{ name, input string; wantErr bool }{
-      {"valid", "Run", false},
-      {"empty", "", true},
-  }
-  for _, tt := range tests {
-      t.Run(tt.name, func(t *testing.T) { /* ... */ })
-  }
-  ```
-
-- **Integration tests against real Postgres** with
-  [testcontainers-go](https://github.com/testcontainers/testcontainers-go). SQLite and
-  Postgres differ (types, constraints, SQL dialect) — a test that passes on SQLite can
-  hide a Postgres bug. Use SQLite for fast unit tests, Postgres for the critical paths.
-- **`t.Cleanup()`** to tear down resources instead of manual defer chains.
-- **Check coverage:** `go test -cover ./...`; focus it on the service layer where the
-  logic lives.
+Now `platform/database` imports no domain (delete its old `internal/models` import), and adding a
+context means adding one `Models()` call here — not editing a central `models.go`.
 
 ---
 
-## Step 9 — Dockerize
+## Step 8 — The finance context, in full
 
-A **two-stage build** keeps the final image small: stage 1 has the Go toolchain and
-compiles; stage 2 is a tiny image with only the binary.
+This is the context most likely still missing from your tree — you may have written
+`finance/domain/` but not `app/`, `infra/`, or `transport/`. Here are all four layers. The shape
+mirrors the routine context exactly; the differences are called out as you go.
 
-### Simple implementation
+### `internal/finance/domain/` — entities, value object, errors, ports
 
-```dockerfile
-# Stage 1 — build
-FROM golang:1.26-alpine AS builder
-WORKDIR /src
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-RUN go build -o server ./cmd/server
-
-# Stage 2 — runtime
-FROM alpine:3.20
-WORKDIR /app
-COPY --from=builder /src/server .
-COPY config.yml .
-EXPOSE 8080
-CMD ["./server"]
-```
-
-Add an `api` service to `docker-compose.yml`:
-
-```yaml
-api:
-  build: .
-  ports:
-    - "8080:8080"
-  env_file:
-    - .env
-  depends_on:
-    - postgres
-```
-
-> **Docker networking:** inside Docker, `localhost` is the container itself — Go can't reach
-> Postgres that way. Set `DB_HOST=postgres` (the compose service name acts as the hostname).
-
-### Best practice
-
-- **Add a `.dockerignore`** (`.git`, `tmp/`, `*.md`, `.env`) so secrets and junk don't get
-  copied into the image and the build context stays small.
-- **`CGO_ENABLED=0`** for a fully static binary, then run on `scratch` or
-  [`distroless`](https://github.com/GoogleContainerTools/distroless) — smaller and far less
-  attack surface than alpine:
-
-  ```dockerfile
-  RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o server ./cmd/server
-  ```
-
-- **Run as non-root** (`USER nonroot`) — don't let a container compromise run as root.
-- **Pin versions** (`golang:1.26.4-alpine`, `postgres:16.3`) so builds are reproducible —
-  `latest` drifts. *(Note: this repo's Dockerfile pins `golang:1.23` but `go.mod` requires
-  1.26 — bump it or the build fails.)*
-- **`depends_on` with a healthcheck condition** so the API waits until Postgres actually
-  accepts connections, not just until the container starts:
-
-  ```yaml
-  postgres:
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER"]
-      interval: 5s
-      retries: 5
-  api:
-    depends_on:
-      postgres:
-        condition: service_healthy
-  ```
-
-- **Use Docker build cache mounts** (`RUN --mount=type=cache,target=/go/pkg/mod`) to speed
-  up repeated builds.
-
----
-
-## End-to-end smoke test
-
-After `make air` (or `docker compose up --build`):
-
-```bash
-curl http://localhost:8080/health
-# -> ok
-
-curl -X POST http://localhost:8080/api/routines \
-  -H "Content-Type: application/json" \
-  -d '{"name": "Morning run", "description": "5km easy pace"}'
-# -> 201 + JSON with id
-
-curl http://localhost:8080/api/routines
-# -> 200 + array of one
-
-curl -X POST http://localhost:8080/api/routines/1/complete
-# -> 201 + log with routine_id, completed_at
-
-curl "http://localhost:8080/api/history?date=2026-06-23"
-# -> 200 + array where "Morning run" has "completed": true
-```
-
-> **Common gotcha:** omitting `-H "Content-Type: application/json"` on POSTs — Fiber's
-> `Bind().Body()` then fails to parse and your body is empty.
-
----
-
-## Troubleshooting
-
-| Error | Fix |
-|-------|-----|
-| `connection refused` on start | `docker compose ps` — is `ray-postgres` running? |
-| `port is already allocated` | Another process owns the host port. `lsof -nP -iTCP:<port> -sTCP:LISTEN`; stop it or change `DB_PORT` in `.env`. |
-| `connection reset by peer` on DB | Host port maps to the wrong container port. Mapping must be `<host>:5432` (Postgres always listens on 5432 inside the container). |
-| `password authentication failed` | `.env` values don't match what Postgres was first created with. The volume persists old creds — `docker compose down -v` to reset. |
-| Tables missing after connect | `AutoMigrate` not called, errored silently, or model not in `AllModels()`. |
-| Bind error on POST | Missing `-H "Content-Type: application/json"`. |
-| `404` on all `/api/` routes | `routes.Register` not called before `app.Listen`. |
-| Panic in terminal | `recover.New()` not added, or a nil service/handler. |
-| CORS error from frontend | `cors.New()` not added, or origin not in the allow-list. |
-| `go.mod requires go >= 1.26` in Docker | Builder image Go version is older than `go.mod`. Bump the `golang:` tag. |
-
----
-
-## Next steps
-
-Steps 1–9 ship a working MVP: create/list/get/complete routines and a daily history,
-served from Postgres, tested, and dockerized. Steps 10–17 take it from "runs on my machine"
-to "I'd let other people use it." Same two-part format — **Simple implementation** to get it
-working, **Best practice** (with examples) for when you harden it.
-
-## Step 10 — Finish the CRUD: Update & Delete
-
-A routine can be created but never edited or removed. Add `Update` and `Delete` to the
-service, handlers, and routes. `Delete` is a **soft delete** — `Base.DeletedAt` makes GORM
-set `deleted_at` instead of removing the row.
-
-### Simple implementation
-
-Service:
+`money.go` (the value object from Step 3) and `transaction.go` you already have. Note the
+**ubiquitous-language constant is `Expense`, not `Expence`** — fix that typo or every comparison
+silently breaks. The full entity keeps `categoryID` (reference another aggregate **by identity**,
+never embed it):
 
 ```go
-func (s *RoutineService) Update(ctx context.Context, id uint, name, description string) (models.Routine, error) {
-    var routine models.Routine
-    if err := s.db.WithContext(ctx).First(&routine, id).Error; err != nil {
-        return models.Routine{}, fmt.Errorf("failed to get routine: %w", err)
-    }
-    if name != "" {
-        routine.Name = name
-    }
-    if description != "" {
-        routine.Description = description
-    }
-    if err := s.db.WithContext(ctx).Save(&routine).Error; err != nil {
-        return models.Routine{}, fmt.Errorf("failed to update routine: %w", err)
-    }
-    return routine, nil
+// transaction.go
+package domain
+
+import "time"
+
+type TransactionType string
+
+const (
+    Income  TransactionType = "income"
+    Expense TransactionType = "expense"
+)
+
+func (t TransactionType) Valid() bool { return t == Income || t == Expense }
+
+type Transaction struct {
+    id         uint
+    categoryID uint
+    amount     Money
+    txType     TransactionType
+    note       string
+    date       time.Time
 }
 
-func (s *RoutineService) Delete(ctx context.Context, id uint) error {
-    res := s.db.WithContext(ctx).Delete(&models.Routine{}, id)
+func NewTransaction(categoryID uint, amount Money, txType TransactionType, note string, date time.Time) (*Transaction, error) {
+    if categoryID == 0 {
+        return nil, ErrCategoryRequired
+    }
+    if !txType.Valid() {
+        return nil, ErrInvalidType
+    }
+    return &Transaction{categoryID: categoryID, amount: amount, txType: txType, note: note, date: date}, nil
+}
+
+func HydrateTransaction(id, categoryID uint, amount Money, txType TransactionType, note string, date time.Time) *Transaction {
+    return &Transaction{id: id, categoryID: categoryID, amount: amount, txType: txType, note: note, date: date}
+}
+
+func (t *Transaction) ID() uint            { return t.id }
+func (t *Transaction) CategoryID() uint    { return t.categoryID }
+func (t *Transaction) Amount() Money       { return t.amount }
+func (t *Transaction) Type() TransactionType { return t.txType }
+func (t *Transaction) Note() string        { return t.note }
+func (t *Transaction) Date() time.Time     { return t.date }
+```
+
+`category.go` — the second aggregate, its own root:
+
+```go
+package domain
+
+type Category struct {
+    id   uint
+    name string
+}
+
+func NewCategory(name string) (*Category, error) {
+    if name == "" {
+        return nil, ErrCategoryNameRequired
+    }
+    return &Category{name: name}, nil
+}
+
+func HydrateCategory(id uint, name string) *Category { return &Category{id: id, name: name} }
+
+func (c *Category) ID() uint     { return c.id }
+func (c *Category) Name() string { return c.name }
+func (c *Category) Rename(name string) error {
+    if name == "" {
+        return ErrCategoryNameRequired
+    }
+    c.name = name
+    return nil
+}
+```
+
+`errors.go`:
+
+```go
+package domain
+
+import "errors"
+
+var (
+    ErrCategoryRequired     = errors.New("category is required")
+    ErrInvalidType          = errors.New("transaction type must be income or expense")
+    ErrTransactionNotFound  = errors.New("transaction not found")
+    ErrCategoryNameRequired = errors.New("category name is required")
+    ErrCategoryNotFound     = errors.New("category not found")
+    ErrDuplicateCategory    = errors.New("category name already exists")
+)
+```
+
+`repository.go` — **two** ports, because there are two aggregates:
+
+```go
+package domain
+
+import "context"
+
+type TransactionRepository interface {
+    Save(ctx context.Context, t *Transaction) error
+    SaveMany(ctx context.Context, ts []*Transaction) error // bulk, all-or-nothing
+    FindByID(ctx context.Context, id uint) (*Transaction, error)
+    FindAll(ctx context.Context) ([]*Transaction, error)
+    Delete(ctx context.Context, id uint) error
+}
+
+type CategoryRepository interface {
+    Save(ctx context.Context, c *Category) error
+    FindByID(ctx context.Context, id uint) (*Category, error)
+    FindAll(ctx context.Context) ([]*Category, error)
+    Delete(ctx context.Context, id uint) error
+}
+```
+
+### `internal/finance/infra/gorm_repository.go` — adapters for both ports
+
+```go
+package infra
+
+import (
+    "context"
+    "errors"
+    "time"
+
+    "github.com/Bayar101/ray-backend/internal/finance/domain"
+    "github.com/jackc/pgx/v5/pgconn"
+    "gorm.io/gorm"
+)
+
+type transactionRecord struct {
+    ID         uint           `gorm:"primaryKey"`
+    CategoryID uint           `gorm:"not null;index"`
+    Amount     int64          `gorm:"not null"` // Money stored as cents
+    Type       string         `gorm:"not null;index;type:varchar(20)"`
+    Note       string         `gorm:"type:text"`
+    Date       time.Time      `gorm:"not null;index"`
+    CreatedAt  time.Time      `gorm:"autoCreateTime"`
+    UpdatedAt  time.Time      `gorm:"autoUpdateTime"`
+    DeletedAt  gorm.DeletedAt `gorm:"index"`
+}
+
+func (transactionRecord) TableName() string { return "transactions" }
+
+type categoryRecord struct {
+    ID        uint           `gorm:"primaryKey"`
+    Name      string         `gorm:"not null;uniqueIndex"`
+    CreatedAt time.Time      `gorm:"autoCreateTime"`
+    UpdatedAt time.Time      `gorm:"autoUpdateTime"`
+    DeletedAt gorm.DeletedAt `gorm:"index"`
+}
+
+func (categoryRecord) TableName() string { return "transaction_categories" }
+
+func Models() []any { return []any{&categoryRecord{}, &transactionRecord{}} } // category first (FK target)
+
+// ---- mappers (Money <-> int64 cents) ----
+
+func txToDomain(rec transactionRecord) *domain.Transaction {
+    amount, _ := domain.NewMoney(rec.Amount) // stored value already valid
+    return domain.HydrateTransaction(rec.ID, rec.CategoryID, amount,
+        domain.TransactionType(rec.Type), rec.Note, rec.Date)
+}
+
+func txToRecord(t *domain.Transaction) transactionRecord {
+    return transactionRecord{
+        ID: t.ID(), CategoryID: t.CategoryID(), Amount: t.Amount().Cents(),
+        Type: string(t.Type()), Note: t.Note(), Date: t.Date(),
+    }
+}
+
+func catToDomain(rec categoryRecord) *domain.Category { return domain.HydrateCategory(rec.ID, rec.Name) }
+func catToRecord(c *domain.Category) categoryRecord   { return categoryRecord{ID: c.ID(), Name: c.Name()} }
+
+// ---- TransactionRepository ----
+
+type TransactionGormRepository struct{ db *gorm.DB }
+
+func NewTransactionGormRepository(db *gorm.DB) *TransactionGormRepository {
+    return &TransactionGormRepository{db: db}
+}
+
+func (r *TransactionGormRepository) Save(ctx context.Context, t *domain.Transaction) error {
+    rec := txToRecord(t)
+    if err := r.db.WithContext(ctx).Save(&rec).Error; err != nil {
+        return err
+    }
+    *t = *txToDomain(rec)
+    return nil
+}
+
+// SaveMany wraps the batch in one DB transaction — partial failure rolls back.
+func (r *TransactionGormRepository) SaveMany(ctx context.Context, ts []*domain.Transaction) error {
+    recs := make([]transactionRecord, len(ts))
+    for i, t := range ts {
+        recs[i] = txToRecord(t)
+    }
+    return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+        if err := tx.Create(&recs).Error; err != nil {
+            return err
+        }
+        for i := range ts {
+            *ts[i] = *txToDomain(recs[i])
+        }
+        return nil
+    })
+}
+
+func (r *TransactionGormRepository) FindByID(ctx context.Context, id uint) (*domain.Transaction, error) {
+    var rec transactionRecord
+    if err := r.db.WithContext(ctx).First(&rec, id).Error; err != nil {
+        if errors.Is(err, gorm.ErrRecordNotFound) {
+            return nil, domain.ErrTransactionNotFound
+        }
+        return nil, err
+    }
+    return txToDomain(rec), nil
+}
+
+func (r *TransactionGormRepository) FindAll(ctx context.Context) ([]*domain.Transaction, error) {
+    var recs []transactionRecord
+    if err := r.db.WithContext(ctx).Find(&recs).Error; err != nil {
+        return nil, err
+    }
+    out := make([]*domain.Transaction, len(recs))
+    for i, rec := range recs {
+        out[i] = txToDomain(rec)
+    }
+    return out, nil
+}
+
+func (r *TransactionGormRepository) Delete(ctx context.Context, id uint) error {
+    res := r.db.WithContext(ctx).Delete(&transactionRecord{}, id)
     if res.Error != nil {
-        return fmt.Errorf("failed to delete routine: %w", res.Error)
+        return res.Error
+    }
+    if res.RowsAffected == 0 {
+        return domain.ErrTransactionNotFound
+    }
+    return nil
+}
+
+// ---- CategoryRepository ----
+
+type CategoryGormRepository struct{ db *gorm.DB }
+
+func NewCategoryGormRepository(db *gorm.DB) *CategoryGormRepository {
+    return &CategoryGormRepository{db: db}
+}
+
+func (r *CategoryGormRepository) Save(ctx context.Context, c *domain.Category) error {
+    rec := catToRecord(c)
+    if err := r.db.WithContext(ctx).Save(&rec).Error; err != nil {
+        var pgErr *pgconn.PgError
+        if errors.As(err, &pgErr) && pgErr.Code == "23505" { // unique violation
+            return domain.ErrDuplicateCategory
+        }
+        return err
+    }
+    *c = *catToDomain(rec)
+    return nil
+}
+
+func (r *CategoryGormRepository) FindByID(ctx context.Context, id uint) (*domain.Category, error) {
+    var rec categoryRecord
+    if err := r.db.WithContext(ctx).First(&rec, id).Error; err != nil {
+        if errors.Is(err, gorm.ErrRecordNotFound) {
+            return nil, domain.ErrCategoryNotFound
+        }
+        return nil, err
+    }
+    return catToDomain(rec), nil
+}
+
+func (r *CategoryGormRepository) FindAll(ctx context.Context) ([]*domain.Category, error) {
+    var recs []categoryRecord
+    if err := r.db.WithContext(ctx).Find(&recs).Error; err != nil {
+        return nil, err
+    }
+    out := make([]*domain.Category, len(recs))
+    for i, rec := range recs {
+        out[i] = catToDomain(rec)
+    }
+    return out, nil
+}
+
+func (r *CategoryGormRepository) Delete(ctx context.Context, id uint) error {
+    res := r.db.WithContext(ctx).Delete(&categoryRecord{}, id)
+    if res.Error != nil {
+        return res.Error
+    }
+    if res.RowsAffected == 0 {
+        return domain.ErrCategoryNotFound
     }
     return nil
 }
 ```
 
-Routes:
+> Importing `pgconn` for the `23505` translation? Run `go mod tidy` — it's currently an indirect
+> dependency and the import promotes it to direct.
+
+### `internal/finance/app/service.go` — one service holding both ports
 
 ```go
-api.Put("/routines/:id", h.Update)
-api.Delete("/routines/:id", h.Delete)
-```
+package app
 
-> **Bug to avoid — load *then* mutate.** If you set `routine.Name = name` *before* calling
-> `First(&routine, id)`, the `First` scan overwrites the struct and your changes are lost —
-> the update silently no-ops. Always `First` first, apply changes second, `Save` last.
+import (
+    "context"
 
-### Best practice
+    "github.com/Bayar101/ray-backend/internal/finance/domain"
+)
 
-- **Detect the missing row on delete.** GORM's `Delete` does **not** return
-  `ErrRecordNotFound` — deleting a non-existent id gives `err == nil` and
-  `RowsAffected == 0`. Without this check the handler returns `200 "deleted"` for a routine
-  that never existed:
-
-  ```go
-  func (s *RoutineService) Delete(ctx context.Context, id uint) error {
-      res := s.db.WithContext(ctx).Delete(&models.Routine{}, id)
-      if res.Error != nil {
-          return fmt.Errorf("failed to delete routine: %w", res.Error)
-      }
-      if res.RowsAffected == 0 {
-          return gorm.ErrRecordNotFound
-      }
-      return nil
-  }
-  ```
-
-- **Map `ErrRecordNotFound` → `404`** in both handlers, same as `Get`:
-
-  ```go
-  if err := h.svc.Delete(c.Context(), uint(id)); err != nil {
-      if errors.Is(err, gorm.ErrRecordNotFound) {
-          return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "routine not found"})
-      }
-      return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
-  }
-  ```
-
-- **Pick the right verb for partial vs full update.** A handler that only changes the
-  non-empty fields is `PATCH` semantics. Either use `api.Patch(...)`, or accept the whole
-  object and replace it for true `PUT`. Don't label a partial update `PUT`.
-- **Soft delete leaves child rows.** `RoutineLog`'s `OnDelete:CASCADE` only fires on a real
-  `DELETE`; a soft delete is an `UPDATE`, so the logs linger (invisible, since queries
-  filter `deleted_at IS NULL`). Fine here — just know they're there if you ever hard-delete.
-
----
-
-## Step 11 — Unique routine name (409 Conflict)
-
-Two live routines named "Morning run" is a bug, not a feature. Enforce uniqueness at the
-**database** (the only race-safe guard), then translate the violation to `409`.
-
-### Simple implementation
-
-Tag the field so new databases get the index:
-
-```go
-// internal/models/routine.go
-Name string `gorm:"not null;uniqueIndex" json:"name"`
-```
-
-`AutoMigrate` then runs `CREATE UNIQUE INDEX idx_routines_name ON routines(name)`.
-
-> **Two gotchas on an existing table:**
-> 1. **Duplicates already present → migration fails.** Postgres won't build a unique index
->    over duplicate rows. Find and clear them first:
->    ```sql
->    SELECT name, COUNT(*) FROM routines GROUP BY name HAVING COUNT(*) > 1;
->    ```
-> 2. **Soft delete breaks a plain `uniqueIndex`.** It covers *all* rows incl. soft-deleted,
->    so create → delete → recreate the same name fails. Use the partial index below.
-
-### Best practice
-
-- **Partial unique index on live rows only.** GORM struct tags can't express a `WHERE`
-  clause, so leave the tag plain and create the index after `AutoMigrate`:
-
-  ```go
-  // internal/database/database.go, after AutoMigrate
-  if err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_routines_name_active
-      ON routines (name) WHERE deleted_at IS NULL`).Error; err != nil {
-      return nil, fmt.Errorf("create unique name index: %w", err)
-  }
-  ```
-
-  > Don't try a composite `uniqueIndex` on `(name, deleted_at)` — Postgres treats `NULL`s
-  > as distinct, so two live rows (`deleted_at = NULL`) slip past. Must be the partial
-  > `WHERE deleted_at IS NULL` index.
-
-- **Catch the violation, don't pre-`SELECT`.** A "does this name exist?" check before
-  insert is a race — two requests both see "free" and both insert. Let the DB reject it and
-  translate Postgres error code `23505`:
-
-  ```go
-  import "github.com/jackc/pgx/v5/pgconn"
-
-  var ErrDuplicateName = errors.New("routine name already exists")
-
-  if err := s.db.WithContext(ctx).Create(&r).Error; err != nil {
-      var pgErr *pgconn.PgError
-      if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-          return models.Routine{}, ErrDuplicateName
-      }
-      return models.Routine{}, fmt.Errorf("failed to create routine: %w", err)
-  }
-  ```
-
-- **Map `ErrDuplicateName` → `409`** in the handler (do the same in `Update` — a rename to
-  a taken name also hits `23505`):
-
-  ```go
-  if errors.Is(err, services.ErrDuplicateName) {
-      return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "routine name already exists"})
-  }
-  ```
-
-- **`go mod tidy`** after importing `pgconn` — it's currently an indirect dependency.
-- **Test the 409 against real Postgres.** `pgconn.PgError` won't surface from the SQLite
-  test DB (different error type), so the conflict path needs a Postgres integration test
-  (Step 15).
-
----
-
-## Step 12 — Input validation as a layer
-
-Hand-written `if name == ""` works for one field; it won't scale. Move validation to a
-declarative layer with [`go-playground/validator`](https://github.com/go-playground/validator),
-running at the HTTP boundary *before* the service is called.
-
-### Simple implementation
-
-```bash
-go get github.com/go-playground/validator/v10
-```
-
-One shared validator instance (reused — don't construct per request):
-
-```go
-// internal/handlers/validate.go
-package handlers
-
-import "github.com/go-playground/validator/v10"
-
-var validate = validator.New(validator.WithRequiredStructEnabled())
-```
-
-Tagged DTOs, validated in the handler:
-
-```go
-type createRoutineInput struct {
-    Name        string `json:"name"        validate:"required,min=1,max=100"`
-    Description string `json:"description" validate:"max=1000"`
+type Service struct {
+    tx  domain.TransactionRepository
+    cat domain.CategoryRepository
 }
 
-func (h *RoutineHandler) Create(c fiber.Ctx) error {
-    var input createRoutineInput
-    if err := c.Bind().Body(&input); err != nil {
-        return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
+func NewService(tx domain.TransactionRepository, cat domain.CategoryRepository) *Service {
+    return &Service{tx: tx, cat: cat}
+}
+
+func (s *Service) Create(ctx context.Context, categoryID uint, cents int64, txType domain.TransactionType, note string, date time.Time) (*domain.Transaction, error) {
+    amount, err := domain.NewMoney(cents)
+    if err != nil {
+        return nil, err
     }
-    if err := validate.Struct(input); err != nil {
+    t, err := domain.NewTransaction(categoryID, amount, txType, note, date)
+    if err != nil {
+        return nil, err
+    }
+    if err := s.tx.Save(ctx, t); err != nil {
+        return nil, err
+    }
+    return t, nil
+}
+
+func (s *Service) List(ctx context.Context) ([]*domain.Transaction, error) { return s.tx.FindAll(ctx) }
+func (s *Service) Get(ctx context.Context, id uint) (*domain.Transaction, error) {
+    return s.tx.FindByID(ctx, id)
+}
+func (s *Service) Delete(ctx context.Context, id uint) error { return s.tx.Delete(ctx, id) }
+
+func (s *Service) CreateCategory(ctx context.Context, name string) (*domain.Category, error) {
+    c, err := domain.NewCategory(name)
+    if err != nil {
+        return nil, err
+    }
+    if err := s.cat.Save(ctx, c); err != nil {
+        return nil, err
+    }
+    return c, nil
+}
+
+func (s *Service) ListCategories(ctx context.Context) ([]*domain.Category, error) {
+    return s.cat.FindAll(ctx)
+}
+```
+
+> Add `import "time"` to the app file — `Create` takes a `time.Time`. (Add `Update`, `BulkCreate`,
+> `GetCategory`, `UpdateCategory`, `DeleteCategory` the same way; they mirror the routine context.)
+
+### `internal/finance/transport/http.go` — handler + DTOs
+
+Same shape as the routine handler: DTOs with `validate` tags, a `toResponse`, one `mapError` that
+translates `domain.ErrTransactionNotFound` → 404, `domain.ErrDuplicateCategory` → 409,
+`domain.ErrInvalidType`/`ErrCategoryRequired` → 400. The constructor is
+`NewHandler(svc *app.Service) *Handler` and `Register` mounts the same routes the old
+`transaction_handler.go` had. The one new mapping detail:
+
+```go
+func mapError(c fiber.Ctx, err error) error {
+    switch {
+    case errors.Is(err, domain.ErrTransactionNotFound), errors.Is(err, domain.ErrCategoryNotFound):
+        return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": err.Error()})
+    case errors.Is(err, domain.ErrDuplicateCategory):
+        return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": err.Error()})
+    case errors.Is(err, domain.ErrInvalidType), errors.Is(err, domain.ErrCategoryRequired),
+        errors.Is(err, domain.ErrCategoryNameRequired), errors.Is(err, domain.ErrNegativeAmount):
         return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+    default:
+        return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "internal error"})
     }
-    // ... call service
 }
 ```
 
-The tag replaces the manual empty-name check in both the handler *and* the service — the
-boundary now guarantees valid input, so the service can trust it.
-
-> **`omitempty` for partial updates.** `Update` is partial (empty field = "leave it"), so
-> its DTO must not mark fields `required`: use `validate:"omitempty,min=1,max=100"`. The
-> rules apply only when the field is present.
-
-### Best practice
-
-- **Return field-level messages,** not validator's raw dump. Map the error:
-
-  ```go
-  func validationErrors(err error) map[string]string {
-      out := map[string]string{}
-      var ve validator.ValidationErrors
-      if errors.As(err, &ve) {
-          for _, fe := range ve {
-              switch fe.Tag() {
-              case "required":
-                  out[fe.Field()] = fe.Field() + " is required"
-              case "max":
-                  out[fe.Field()] = fe.Field() + " too long (max " + fe.Param() + ")"
-              default:
-                  out[fe.Field()] = "invalid " + fe.Field()
-              }
-          }
-      }
-      return out
-  }
-  // → {"errors": {"Name": "Name is required"}}
-  ```
-
-- **Hook the validator into Fiber** so `Bind().Body()` validates automatically (one less
-  call per handler):
-
-  ```go
-  type structValidator struct{ v *validator.Validate }
-  func (s structValidator) Validate(out any) error { return s.v.Struct(out) }
-
-  app := fiber.New(fiber.Config{
-      StructValidator: structValidator{v: validator.New()},
-  })
-  ```
-
-- **Keep validation (`400`) separate from uniqueness (`409`).** The validator can't know a
-  name is already taken — that's a DB round-trip (Step 11). Validator → `400`,
-  `23505` → `409`.
-
----
-
-## Step 13 — Harden routes & middleware
-
-Step 6 shipped the middleware defaults. Here are the production versions, each with the
-example.
-
-### Simple implementation
-
-The Step 6 stack — `logger`, `recover`, `cors.New()`, one `/health` — is the simple
-version. Everything below tightens it.
-
-### Best practice
-
-- **Config-driven CORS allow-list** instead of all-origins default, so dev and prod differ
-  without code changes:
-
-  ```go
-  app.Use(cors.New(cors.Config{
-      AllowOrigins: cfg.CORS.AllowedOrigins, // ["http://localhost:5173"] in dev
-      AllowMethods: []string{"GET", "POST", "PUT", "DELETE"},
-  }))
-  ```
-
-- **Request-ID middleware before the logger,** so every log line and error carries a
-  correlation ID:
-
-  ```go
-  import "github.com/gofiber/fiber/v3/middleware/requestid"
-
-  app.Use(requestid.New())
-  app.Use(logger.New())
-  // in a handler: reqID := requestid.FromContext(c)
-  ```
-
-- **Request-timeout middleware** so a slow query can't pin a connection. Relies on the
-  `WithContext(ctx)` discipline already in the service layer to actually cancel the query:
-
-  ```go
-  app.Use(func(c fiber.Ctx) error {
-      ctx, cancel := context.WithTimeout(c.Context(), 5*time.Second)
-      defer cancel()
-      c.SetContext(ctx)
-      return c.Next()
-  })
-  ```
-
-- **Split liveness from readiness** — orchestrators use them differently:
-
-  ```go
-  app.Get("/health", func(c fiber.Ctx) error { return c.SendString("ok") }) // process up
-  app.Get("/ready", func(c fiber.Ctx) error {                                // deps reachable
-      sqlDB, _ := db.DB()
-      if err := sqlDB.Ping(); err != nil {
-          return c.SendStatus(fiber.StatusServiceUnavailable)
-      }
-      return c.SendString("ready")
-  })
-  ```
-
-- **Version the API** so breaking changes ship under `/v2` without breaking clients:
-
-  ```go
-  api := app.Group("/api/v1")
-  ```
-
----
-
-## Step 14 — Production-grade `main.go`
-
-Step 7's `main` loads, connects, and listens — but `log.Fatal` skips cleanup and a `Ctrl-C`
-drops in-flight requests. Harden the entrypoint.
-
-### Simple implementation
-
-The Step 7 `main` (load config → connect → build → listen) is the simple version.
-
-### Best practice
-
-- **Extract `run() error`** so deferred cleanup runs (`defer` doesn't fire on
-  `os.Exit`, which `log.Fatal` calls):
-
-  ```go
-  func main() {
-      if err := run(); err != nil {
-          log.Fatal(err)
-      }
-  }
-
-  func run() error {
-      cfg, err := config.Load()
-      if err != nil {
-          return err
-      }
-      // ... build app
-  }
-  ```
-
-- **Graceful shutdown** on `SIGINT`/`SIGTERM` so in-flight requests finish and the pool
-  closes cleanly:
-
-  ```go
-  go func() { _ = app.Listen(":" + cfg.App.Port) }()
-
-  quit := make(chan os.Signal, 1)
-  signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
-  <-quit
-  _ = app.ShutdownWithTimeout(10 * time.Second)
-  ```
-
-- **Structured logging** with `log/slog` instead of the standard `log`, so prod logs are
-  queryable JSON:
-
-  ```go
-  logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-  slog.SetDefault(logger)
-  slog.Info("server starting", "port", cfg.App.Port)
-  ```
-
-- **Configure the connection pool** (Step 3) once the DB is open:
-
-  ```go
-  sqlDB, _ := db.DB()
-  sqlDB.SetMaxOpenConns(25)
-  sqlDB.SetMaxIdleConns(5)
-  sqlDB.SetConnMaxLifetime(time.Hour)
-  ```
-
----
-
-## Step 15 — Broaden the test suite
-
-Only `Create` is covered. Add cases for every method, with the gnarly date logic getting
-the most attention.
-
-### Simple implementation
-
-Table-driven service tests against the in-memory SQLite DB from Step 8. The highest-value
-target is `DailyHistory` — its day-boundary JOIN is the easiest thing to get subtly wrong:
+Wire it in `main.go` — finance has **two** repos, so its constructor takes both:
 
 ```go
-func TestDailyHistory(t *testing.T) {
-    tests := []struct {
-        name          string
-        completeOnDay bool
-        offsetDays    int  // query date relative to completion day
-        wantCompleted bool
-    }{
-        {"completed today",     true,  0,  true},
-        {"not completed",       false, 0,  false},
-        {"completed other day", true,  -1, false}, // log exists, wrong day
-    }
-    for _, tt := range tests {
-        t.Run(tt.name, func(t *testing.T) {
-            svc := services.NewRoutineService(newTestDB(t)) // fresh DB per case
-            r, _ := svc.Create(t.Context(), "Run", "")
-            if tt.completeOnDay {
-                svc.Complete(t.Context(), r.ID)
-            }
-            day := time.Now().AddDate(0, 0, tt.offsetDays)
-            entries, err := svc.DailyHistory(t.Context(), day)
-            if err != nil {
-                t.Fatal(err)
-            }
-            if entries[0].Completed != tt.wantCompleted {
-                t.Fatalf("completed = %v, want %v", entries[0].Completed, tt.wantCompleted)
-            }
-        })
+txRepo  := financeinfra.NewTransactionGormRepository(db)
+catRepo := financeinfra.NewCategoryGormRepository(db)
+financeSvc  := financeapp.NewService(txRepo, catRepo)
+financeHTTP := financetransport.NewHandler(financeSvc)
+```
+
+### Why this differs from the routine context
+
+- **Two aggregates, two repositories.** `Transaction` references `Category` **by `categoryID`, not
+  by embedding** — that's why the old `Category TransactionCategory` association field is gone.
+  Need the category name in a response? The app layer fetches both and composes a DTO.
+- **`Money` replaces `Amount int64`.** The record column stays `int64` cents; the mappers convert
+  with `Money.Cents()` and `NewMoney()`.
+- **`BulkCreate` → `SaveMany`,** wrapped in `db.Transaction(...)` so a partial batch rolls back.
+  All-or-nothing is what the app layer asks for; the *how* (a DB transaction) is infra's business.
+- **Duplicate category name → `domain.ErrDuplicateCategory` → 409.** The DB unique index is the
+  race-safe guard; infra catches Postgres `23505` and translates it. The handler's old
+  `validate:"unique"` tag never actually did this — the repository is the correct place.
+
+---
+
+## Migration order (do it incrementally, keep it green)
+
+Don't big-bang this. One context at a time, building after each step:
+
+1. **Step 1** — move `config`/`database` to `platform/`. `go build ./...`. Commit.
+2. **Routine context, vertically:**
+   a. Create `routine/domain/` (entity, value objects, errors, repository interface).
+   b. Create `routine/infra/` (GORM repo + record + mappers). `go build ./...`.
+   c. Create `routine/app/` (use cases calling the repo interface).
+   d. Create `routine/transport/` (handler + DTOs + `mapError`).
+   e. Rewire `main.go` for routines; delete old `models/routine.go`, `services/routine_service.go`,
+      `handlers/routine_handler.go`. `go build ./... && go test ./...`. Commit.
+3. **Finance context** — repeat 2a–2e. Commit.
+4. **Delete the now-empty `internal/models`, `internal/services`, `internal/handlers`.** Move the
+   shared validator into `platform/httpx`. Final `go build ./... && go test ./...`. Commit.
+
+Keeping the build green between contexts means you can stop and ship at any point — the routine
+context can be fully DDD while finance is still legacy, because they don't import each other.
+
+---
+
+## Testing got easier (the proof DDD worked)
+
+The old `routines_test.go` needed an in-memory SQLite DB (`gorm.Open(sqlite...)`) just to test
+`Create`. With the repository interface, the **domain and app layers test with no database at all**:
+
+```go
+// a fake repo — 20 lines, no SQLite, no Docker
+type fakeRepo struct{ store map[uint]*domain.Routine; seq uint }
+
+func (f *fakeRepo) Save(_ context.Context, r *domain.Routine) error { /* assign id, store */ }
+func (f *fakeRepo) FindByID(_ context.Context, id uint) (*domain.Routine, error) {
+    if r, ok := f.store[id]; ok { return r, nil }
+    return nil, domain.ErrRoutineNotFound
+}
+
+func TestComplete_UnknownRoutine(t *testing.T) {
+    svc := app.NewService(&fakeRepo{store: map[uint]*domain.Routine{}})
+    _, err := svc.Complete(context.Background(), 999)
+    if !errors.Is(err, domain.ErrRoutineNotFound) {
+        t.Fatalf("want ErrRoutineNotFound, got %v", err)
     }
 }
 ```
 
-### Best practice
+Invariant tests are even simpler — pure functions, no service, no repo:
 
-- **Handler tests** via `app.Test(req)` to assert status codes and JSON shape end-to-end:
-
-  ```go
-  req := httptest.NewRequest("GET", "/api/routines/999", nil)
-  resp, _ := app.Test(req)
-  if resp.StatusCode != fiber.StatusNotFound {
-      t.Fatalf("got %d, want 404", resp.StatusCode)
-  }
-  ```
-
-- **Integration tests against real Postgres** with
-  [testcontainers-go](https://github.com/testcontainers/testcontainers-go) — SQLite and
-  Postgres differ enough (types, constraints, the `23505` path from Step 11) that a green
-  SQLite test can hide a Postgres bug:
-
-  ```go
-  pg, _ := postgres.Run(ctx, "postgres:16",
-      postgres.WithDatabase("test"), postgres.WithUsername("t"), postgres.WithPassword("t"))
-  t.Cleanup(func() { pg.Terminate(ctx) })
-  ```
-
-- **`t.Cleanup()`** for teardown instead of manual defer chains, and **`go test -cover ./...`**
-  to find untested branches — focus coverage on the service layer where the logic lives.
-
----
-
-## Step 16 — Versioned migrations
-
-`AutoMigrate` only *adds* — it can't express renames, backfills, or safe column drops, and
-auto-running schema changes on every deploy is risky. Graduate to checked-in migration
-files.
-
-### Simple implementation
-
-Keep `AutoMigrate` for local/dev and tests; that's the simple version and it's fine until
-you ship to a shared environment.
-
-### Best practice
-
-- **Adopt [`golang-migrate`](https://github.com/golang-migrate/migrate)** (or
-  [`goose`](https://github.com/pressly/goose)). Each change is a numbered `up`/`down` pair
-  checked into the repo:
-
-  ```
-  migrations/
-  ├── 000001_create_routines.up.sql
-  ├── 000001_create_routines.down.sql
-  ├── 000002_unique_name_index.up.sql   -- the Step 11 partial index lives here
-  └── 000002_unique_name_index.down.sql
-  ```
-
-  ```sql
-  -- 000002_unique_name_index.up.sql
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_routines_name_active
-      ON routines (name) WHERE deleted_at IS NULL;
-  ```
-
-- **Run migrations as an explicit deploy step,** not on app boot:
-
-  ```bash
-  migrate -path ./migrations -database "$DATABASE_URL" up
-  ```
-
-- **Disable `AutoMigrate` in production** (gate it on `cfg.App.Mode != "production"`) so the
-  migration files are the single source of schema truth.
-
----
-
-## Step 17 — CI pipeline
-
-Stop "works on my machine" regressions before they merge. A push-triggered workflow that
-builds, vets, and tests.
-
-### Simple implementation
-
-A GitHub Actions workflow at `.github/workflows/ci.yml`:
-
-```yaml
-name: CI
-on: [push, pull_request]
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with: { go-version: '1.26' }
-      - run: go vet ./...
-      - run: go test -race ./...
-      - run: go build ./...
+```go
+func TestNewRoutine_RejectsEmptyName(t *testing.T) {
+    if _, err := domain.NewRoutine("", ""); !errors.Is(err, domain.ErrNameRequired) {
+        t.Fatalf("want ErrNameRequired, got %v", err)
+    }
+}
 ```
 
-### Best practice
-
-- **Add static analysis** with [`golangci-lint`](https://golangci-lint.run/) — catches far
-  more than `go vet`:
-
-  ```yaml
-      - uses: golangci/golangci-lint-action@v6
-  ```
-
-- **Run integration tests too.** Actions provides Postgres as a service container, so the
-  testcontainers/Postgres tests from Step 15 run in CI:
-
-  ```yaml
-      services:
-        postgres:
-          image: postgres:16
-          env: { POSTGRES_PASSWORD: test }
-          ports: ["5432:5432"]
-          options: >-
-            --health-cmd pg_isready --health-interval 5s --health-retries 5
-  ```
-
-- **Gate merges on CI** with a branch-protection rule, and **report coverage**
-  (`go test -coverprofile=cover.out ./...`) so it can't silently rot.
+Keep one **integration** test per context that runs the real GORM repo against Postgres
+(testcontainers) — that's where the `23505` duplicate-name path and the `DailyHistory` JOIN must be
+verified, since a fake repo can't catch SQL bugs.
 
 ---
 
-## Further out
+## Concept map: old → new
 
-- **Auth & multi-tenant** — users own their routines (`user_id` FK, JWT or session
-  middleware, scope every query by the authenticated user).
-- **Pagination & filtering** on `List` (`?limit=&offset=`, or keyset pagination) before the
-  table grows.
-- **Observability** — structured logs + metrics (Prometheus `/metrics`) + tracing.
-- **Rate limiting** (`limiter` middleware) on write endpoints.
-- **OpenAPI spec** generated from the handlers so the frontend has a typed contract.
+| Today | DDD home | Why it moved |
+|-------|----------|--------------|
+| `models.Routine` (struct + GORM/JSON tags) | `routine/domain/routine.go` (behavior) **+** `routine/infra` record **+** `transport` DTO | One struct was doing three jobs (business, storage, wire). Split by responsibility. |
+| `RoutineService` holding `*gorm.DB` | `routine/app/service.go` (orchestration) **+** `routine/infra/gorm_repository.go` (SQL) | Business logic must not depend on the DB driver. |
+| `name == ""` check inside service | `domain.NewRoutine` constructor | Invariants belong on the entity, enforced at construction. |
+| `Amount int64`, validator tag on `Type` | `finance/domain/money.go`, `TransactionType.Valid()` | Primitives hiding rules → value objects that own the rules. |
+| `gorm.ErrRecordNotFound` checked in handlers | `domain.ErrRoutineNotFound`, mapped once in `mapError` | Stop leaking the persistence technology upward. |
+| `models.AllModels()` central registry | each `infra.Models()`, gathered in composition root | Shared code must not import domains; contexts own their tables. |
+| `internal/config`, `internal/database` | `internal/platform/...` | Domain-agnostic plumbing, shared by all contexts. |
+
+---
+
+## The pragmatic dial (don't over-engineer a side project)
+
+Full DDD has real ceremony: three structs per concept (domain/record/DTO), mapping functions,
+rehydration factories. For a learning project that's a lot. Dials you can turn *down* without
+losing the spirit:
+
+- **Skip separate DTOs at first.** Let transport serialize the domain entity via small accessor
+  methods or a single `ToResponse()`. Add DTOs when the wire shape and domain shape actually diverge.
+- **Reuse one struct for domain + record** if you can tolerate GORM tags on the entity — you keep
+  the *repository interface* (the valuable part: DB independence + testability) without the
+  mapping boilerplate. You lose strict invariant protection; that's the trade.
+- **Don't build value objects for primitives that carry no rules.** `Description` is just a string.
+  Only `Amount` and `Type` earned the `Money`/`TransactionType` treatment.
+
+The non-negotiables — the things that *are* DDD and pay for themselves even here:
+
+1. **Group by bounded context** (`routine/`, `finance/`), not by technical layer.
+2. **A repository interface** so the domain doesn't import GORM and tests don't need a database.
+3. **Domain errors** instead of leaking `gorm.ErrRecordNotFound`.
+4. **Invariants live with the data** they constrain.
+
+Start with those four. Add the rest when the project's size justifies it.
+
+---
+
+## Migration status — DONE (verified 2026-06-29)
+
+Steps 1–8 complete. `go build ./...` clean, `go test ./...` passes. Final tree:
+
+```
+internal/
+├── platform/   config, database, httpx       ✅
+├── routine/    domain, app, infra, transport  ✅
+└── finance/    domain, app, infra, transport  ✅
+```
+
+- Old `internal/{config,database,models,services,handlers}` deleted ✅
+- `database.Connect(cfg, models...)` takes model list; `main` gathers via `Models()` ✅
+- finance fully built: transaction + category CRUD, `BulkCreate`/`SaveMany`, `23505` → `ErrDuplicateCategory` ✅
+- `go mod tidy` run — `pgconn` resolved ✅
+
+---
+
+## Next steps
+
+### 1. Commit the migration (do this first)
+Build is green. Stage and commit before adding anything new — keeps the refactor isolated.
+```bash
+git add -A && git commit   # message: "refactor: migrate to DDD bounded contexts (routine, finance)"
+```
+
+### 2. Replace the SQLite test with DB-free unit tests
+`internal/routes/routines_test.go` still spins up in-memory SQLite to test `app.Service.Create`.
+The whole point of the repo interface (Step 4) is that app/domain test with **no DB**:
+- Add `internal/routine/app/service_test.go` with a `fakeRepo` (the ~20-line stub from the
+  "Testing got easier" section) — covers `Create`, `Complete` (unknown id → `ErrRoutineNotFound`).
+- Add `internal/routine/domain/routine_test.go` — pure invariant tests (`NewRoutine("")` →
+  `ErrNameRequired`, name-too-long). No service, no repo.
+- Mirror for finance: `domain.NewMoney(-1)` → `ErrNegativeAmount`, `TransactionType.Valid()`,
+  `NewTransaction` with `categoryID==0`.
+- Then delete/relocate the SQLite `routines_test.go` (or downgrade it to an integration test, below).
+
+### 3. One integration test per context (real GORM + Postgres)
+Fakes can't catch SQL bugs. Use testcontainers-go (or a disposable Postgres) to verify the paths
+that only exist in infra:
+- routine: `DailyHistory` JOIN returns correct `completed` flag across the day boundary.
+- finance: duplicate category name actually hits `23505` → `ErrDuplicateCategory`;
+  `SaveMany` rolls back fully on a partial-batch failure.
+
+### 4. Loose ends to confirm
+- `platform/httpx/validate.go` — confirm both transport layers use the shared validator and
+  `main.go` wires `StructValidator`.
+- Grep for any lingering `gorm.ErrRecordNotFound` outside `infra/` — should be zero.
+- Decide whether `routes_test.go` belongs in `routes` or moves next to each context.
