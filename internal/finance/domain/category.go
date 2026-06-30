@@ -12,6 +12,14 @@ func NewTransactionCategory(name string) (*TransactionCategory, error) {
 	return &TransactionCategory{name: name}, nil
 }
 
+func (c *TransactionCategory) Rename(name string) error {
+	if name == "" {
+		return ErrTransactionCategoryNameRequired
+	}
+	c.name = name
+	return nil
+}
+
 func HydrateTransactionCategory(id uint, name string) *TransactionCategory {
 	return &TransactionCategory{
 		id:   id,
@@ -21,10 +29,3 @@ func HydrateTransactionCategory(id uint, name string) *TransactionCategory {
 
 func (c *TransactionCategory) ID() uint     { return c.id }
 func (c *TransactionCategory) Name() string { return c.name }
-func (c *TransactionCategory) Rename(name string) error {
-	if name == "" {
-		return ErrTransactionCategoryNameRequired
-	}
-	c.name = name
-	return nil
-}

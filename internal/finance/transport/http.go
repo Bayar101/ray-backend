@@ -54,7 +54,7 @@ func transactionToResponse(t *domain.Transaction) transactionResponse {
 	return transactionResponse{
 		ID:         t.ID(),
 		CategoryID: t.TransactionCategoryID(),
-		Amount:     t.Amount().Cents(),
+		Amount:     t.Amount(),
 		Type:       t.Type(),
 		Note:       t.Note(),
 		Date:       t.Date(),
@@ -80,14 +80,11 @@ func (h *Handler) BulkCreate(c fiber.Ctx) error {
 	}
 	list := make([]*domain.Transaction, len(inputs))
 	for i, in := range inputs {
-		amount, err := domain.NewMoney(in.Amount)
-		if err != nil {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid amount"})
-		}
-		list[i], err = domain.NewTransaction(in.CategoryID, amount, in.Type, in.Note, in.Date)
+		t, err := domain.NewTransaction(in.CategoryID, in.Amount, in.Type, in.Note, in.Date)
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid transaction"})
 		}
+		list[i] = t
 	}
 
 	transactions, err := h.s.BulkCreate(c.Context(), list)
@@ -235,7 +232,7 @@ func mapError(c fiber.Ctx, err error) error {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "not found"})
 	case errors.Is(err, domain.ErrDuplicateTransactionCategory):
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "duplicate category"})
-	case errors.Is(err, domain.ErrInvalidType), errors.Is(err, domain.ErrTransactionCategoryNameRequired), errors.Is(err, domain.ErrNegativeAmount):
+	case errors.Is(err, domain.ErrInvalidType), errors.Is(err, domain.ErrTransactionCategoryNameRequired), errors.Is(err, domain.ErrInvalidAmount):
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	default:
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "internal server error"})

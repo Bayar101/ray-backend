@@ -107,7 +107,7 @@ func (r *GormRepository) DailyHistory(ctx context.Context, day time.Time) ([]dom
 		Select("routines.id AS routine_id, routines.name, routines.description, COUNT(routine_logs.id) > 0 AS completed").
 		Joins(`LEFT JOIN routine_logs
 			ON routine_logs.routine_id = routines.id
-			AND routines_log.completed_at >= ?
+			AND routine_logs.completed_at >= ?
 			AND routine_logs.completed_at < ?
 			AND routine_logs.deleted_at IS NULL`, start, end).
 		Group("routines.id").

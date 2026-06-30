@@ -39,15 +39,14 @@ func Models() []any { return []any{&transactionRecord{}, &transactionCategoryRec
 // mappers
 
 func txToDomain(rec transactionRecord) *domain.Transaction {
-	amount, _ := domain.NewMoney(rec.Amount)
-	return domain.HydrateTransaction(rec.ID, rec.TransactionCategoryID, amount, domain.TransactionType(rec.Type), rec.Note, rec.Date)
+	return domain.HydrateTransaction(rec.ID, rec.TransactionCategoryID, rec.Amount, domain.TransactionType(rec.Type), rec.Note, rec.Date)
 }
 
 func txToRecord(t *domain.Transaction) transactionRecord {
 	return transactionRecord{
 		ID:                    t.ID(),
 		TransactionCategoryID: t.TransactionCategoryID(),
-		Amount:                t.Amount().Cents(),
+		Amount:                t.Amount(),
 		Type:                  string(t.Type()),
 		Note:                  t.Note(),
 		Date:                  t.Date(),

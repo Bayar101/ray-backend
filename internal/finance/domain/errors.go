@@ -6,6 +6,7 @@ var (
 	ErrTransactionCategoryRequired     = errors.New("transaction category is required")
 	ErrInvalidAmount                   = errors.New("invalid amount")
 	ErrInvalidType                     = errors.New("invalid type")
+	ErrInvalidDate                     = errors.New("invalid date")
 	ErrTransactionNotFound             = errors.New("transaction not found")
 	ErrNoteTooLong                     = errors.New("note too long")
 	ErrTransactionCategoryNotFound     = errors.New("transaction category not found")

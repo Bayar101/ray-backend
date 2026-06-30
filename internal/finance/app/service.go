@@ -16,11 +16,7 @@ func NewService(tx domain.TransactionRepository, cat domain.TransactionCategoryR
 	return &Service{tx: tx, cat: cat}
 }
 
-func (s *Service) Create(ctx context.Context, categoryID uint, cents int64, txType domain.TransactionType, note string, date time.Time) (*domain.Transaction, error) {
-	amount, err := domain.NewMoney(cents)
-	if err != nil {
-		return nil, err
-	}
+func (s *Service) Create(ctx context.Context, categoryID uint, amount int64, txType domain.TransactionType, note string, date time.Time) (*domain.Transaction, error) {
 	t, err := domain.NewTransaction(categoryID, amount, txType, note, date)
 	if err != nil {
 		return nil, err
@@ -46,7 +42,7 @@ func (s *Service) Get(ctx context.Context, id uint) (*domain.Transaction, error)
 	return s.tx.FindByID(ctx, id)
 }
 
-func (s *Service) Update(ctx context.Context, id uint, categoryID uint, cents int64, txType domain.TransactionType, note string, date time.Time) (*domain.Transaction, error) {
+func (s *Service) Update(ctx context.Context, id uint, categoryID uint, amount int64, txType domain.TransactionType, note string, date time.Time) (*domain.Transaction, error) {
 	t, err := s.tx.FindByID(ctx, id)
 	if err != nil {
 		return nil, err
@@ -55,11 +51,7 @@ func (s *Service) Update(ctx context.Context, id uint, categoryID uint, cents in
 		t.SetCategoryID(categoryID)
 	}
 
-	if cents != 0 {
-		amount, err := domain.NewMoney(cents)
-		if err != nil {
-			return nil, err
-		}
+	if amount != 0 {
 		t.SetAmount(amount)
 	}
 	if txType != "" {
