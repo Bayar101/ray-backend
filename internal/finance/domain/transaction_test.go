@@ -98,8 +98,8 @@ func TestTransaction_SetCategoryID_RejectsZero(t *testing.T) {
 	if err := tx.SetCategoryID(0); !errors.Is(err, domain.ErrTransactionCategoryRequired) {
 		t.Fatalf("want ErrTransactionCategoryRequired, got %v", err)
 	}
-	if tx.TransactionCategoryID() != 1 {
-		t.Fatalf("categoryID mutated on failed set: %d", tx.TransactionCategoryID())
+	if tx.CategoryID() != 1 {
+		t.Fatalf("categoryID mutated on failed set: %d", tx.CategoryID())
 	}
 }
 

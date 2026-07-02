@@ -1,7 +1,7 @@
 app:
-  port: "8080"
+  port: "8088"
   mode: development
-  base_url: http://localhost:8080
+  base_url: http://localhost:8088
 
 db:
   host: localhost

@@ -16,10 +16,18 @@ func NewService(tx domain.TransactionRepository, cat domain.TransactionCategoryR
 	return &Service{tx: tx, cat: cat}
 }
 
+type TransactionView struct {
+	Transaction  *domain.Transaction
+	CategoryName string
+}
+
 func (s *Service) Create(ctx context.Context, categoryID uint, amount int64, txType domain.TransactionType, note string, date time.Time) (*domain.Transaction, error) {
 	t, err := domain.NewTransaction(categoryID, amount, txType, note, date)
 	if err != nil {
 		return nil, err
+	}
+	if _, err := s.cat.FindByID(ctx, categoryID); err != nil {
+		return nil, err // ErrTransactionCategoryNotFound from the repo
 	}
 	if err := s.tx.Save(ctx, t); err != nil {
 		return nil, err
@@ -34,12 +42,36 @@ func (s *Service) BulkCreate(ctx context.Context, transactions []*domain.Transac
 	return transactions, nil
 }
 
-func (s *Service) List(ctx context.Context) ([]*domain.Transaction, error) {
-	return s.tx.FindAll(ctx)
+func (s *Service) List(ctx context.Context) ([]TransactionView, error) {
+	txs, err := s.tx.FindAll(ctx)
+	if err != nil {
+		return nil, err
+	}
+	cats, err := s.cat.FindAll(ctx)
+	if err != nil {
+		return nil, err
+	}
+	name := make(map[uint]string, len(cats))
+	for _, c := range cats {
+		name[c.ID()] = c.Name()
+	}
+	out := make([]TransactionView, len(txs))
+	for i, t := range txs {
+		out[i] = TransactionView{Transaction: t, CategoryName: name[t.CategoryID()]}
+	}
+	return out, nil
 }
 
-func (s *Service) Get(ctx context.Context, id uint) (*domain.Transaction, error) {
-	return s.tx.FindByID(ctx, id)
+func (s *Service) Get(ctx context.Context, id uint) (TransactionView, error) {
+	t, err := s.tx.FindByID(ctx, id)
+	if err != nil {
+		return TransactionView{}, err
+	}
+	cat, err := s.cat.FindByID(ctx, t.CategoryID())
+	if err != nil {
+		return TransactionView{}, err
+	}
+	return TransactionView{Transaction: t, CategoryName: cat.Name()}, nil
 }
 
 func (s *Service) Update(ctx context.Context, id uint, categoryID uint, amount int64, txType domain.TransactionType, note string, date time.Time) (*domain.Transaction, error) {
@@ -48,6 +80,9 @@ func (s *Service) Update(ctx context.Context, id uint, categoryID uint, amount i
 		return nil, err
 	}
 	if categoryID != 0 {
+		if _, err := s.cat.FindByID(ctx, categoryID); err != nil {
+			return nil, err // ErrTransactionCategoryNotFound from the repo
+		}
 		t.SetCategoryID(categoryID)
 	}
 
@@ -71,6 +106,14 @@ func (s *Service) Update(ctx context.Context, id uint, categoryID uint, amount i
 
 func (s *Service) Delete(ctx context.Context, id uint) error {
 	return s.tx.Delete(ctx, id)
+}
+
+func (s *Service) Summary(ctx context.Context, from, to time.Time) (*domain.Summary, error) {
+	su, err := s.tx.SummaryBetween(ctx, from, to)
+	if err != nil {
+		return nil, err
+	}
+	return su, nil
 }
 
 // Transaction Category Service

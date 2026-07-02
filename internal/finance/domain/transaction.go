@@ -14,16 +14,16 @@ func (t TransactionType) Valid() bool {
 }
 
 type Transaction struct {
-	id                    uint
-	transactionCategoryID uint
-	amount                int64
-	txType                TransactionType
-	note                  string
-	date                  time.Time
+	id         uint
+	categoryID uint
+	amount     int64
+	txType     TransactionType
+	note       string
+	date       time.Time
 }
 
-func NewTransaction(transactionCategoryID uint, amount int64, txType TransactionType, note string, date time.Time) (*Transaction, error) {
-	if transactionCategoryID == 0 {
+func NewTransaction(categoryID uint, amount int64, txType TransactionType, note string, date time.Time) (*Transaction, error) {
+	if categoryID == 0 {
 		return nil, ErrTransactionCategoryRequired
 	}
 	if amount <= 0 {
@@ -39,11 +39,11 @@ func NewTransaction(transactionCategoryID uint, amount int64, txType Transaction
 		return nil, ErrInvalidDate
 	}
 	return &Transaction{
-		transactionCategoryID: transactionCategoryID,
-		amount:                amount,
-		txType:                txType,
-		note:                  note,
-		date:                  date,
+		categoryID: categoryID,
+		amount:     amount,
+		txType:     txType,
+		note:       note,
+		date:       date,
 	}, nil
 }
 
@@ -51,7 +51,7 @@ func (t *Transaction) SetCategoryID(categoryID uint) error {
 	if categoryID == 0 {
 		return ErrTransactionCategoryRequired
 	}
-	t.transactionCategoryID = categoryID
+	t.categoryID = categoryID
 	return nil
 }
 
@@ -85,20 +85,20 @@ func (t *Transaction) SetDate(date time.Time) error {
 	return nil
 }
 
-func HydrateTransaction(id, transactionCategoryID uint, amount int64, txType TransactionType, note string, date time.Time) *Transaction {
+func HydrateTransaction(id, categoryID uint, amount int64, txType TransactionType, note string, date time.Time) *Transaction {
 	return &Transaction{
-		id:                    id,
-		transactionCategoryID: transactionCategoryID,
-		amount:                amount,
-		txType:                txType,
-		note:                  note,
-		date:                  date,
+		id:         id,
+		categoryID: categoryID,
+		amount:     amount,
+		txType:     txType,
+		note:       note,
+		date:       date,
 	}
 }
 
-func (t *Transaction) ID() uint                    { return t.id }
-func (t *Transaction) TransactionCategoryID() uint { return t.transactionCategoryID }
-func (t *Transaction) Amount() int64               { return t.amount }
-func (t *Transaction) Type() TransactionType       { return t.txType }
-func (t *Transaction) Note() string                { return t.note }
-func (t *Transaction) Date() time.Time             { return t.date }
+func (t *Transaction) ID() uint              { return t.id }
+func (t *Transaction) CategoryID() uint      { return t.categoryID }
+func (t *Transaction) Amount() int64         { return t.amount }
+func (t *Transaction) Type() TransactionType { return t.txType }
+func (t *Transaction) Note() string          { return t.note }
+func (t *Transaction) Date() time.Time       { return t.date }

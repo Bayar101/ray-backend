@@ -2,6 +2,10 @@ package main
 
 import (
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/Bayar101/ray-backend/internal/platform/config"
 	"github.com/Bayar101/ray-backend/internal/platform/database"
@@ -55,5 +59,15 @@ func main() {
 
 	routes.Register(app, routineHTTP, financeHTTP)
 
-	log.Fatal(app.Listen(":" + cfg.App.Port))
+	go func() {
+		if err := app.Listen(":" + cfg.App.Port); err != nil {
+			log.Fatalf("listen failed: %v", err)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+	<-quit
+	_ = app.ShutdownWithTimeout(10 * time.Second)
+
 }

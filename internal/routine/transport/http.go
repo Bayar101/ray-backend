@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Bayar101/ray-backend/internal/platform/httpx"
 	"github.com/Bayar101/ray-backend/internal/routine/app"
 	"github.com/Bayar101/ray-backend/internal/routine/domain"
 	"github.com/gofiber/fiber/v3"
@@ -21,7 +22,7 @@ func (h *Handler) Register(rg fiber.Router) {
 	rg.Put("/update/:id", h.Update)
 	rg.Delete("/delete/:id", h.Delete)
 	rg.Post("/complete/:id", h.Complete)
-	rg.Get("/history?date=YYYY-MM-DD", h.DailyHistory)
+	rg.Get("/history", h.DailyHistory)
 }
 
 type routineInput struct {
@@ -42,7 +43,7 @@ func toResponse(r *domain.Routine) routineResponse {
 func (h *Handler) Create(c fiber.Ctx) error {
 	var in routineInput
 	if err := c.Bind().Body(&in); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
+		return httpx.Error(c, fiber.StatusBadRequest, "invalid body")
 	}
 	r, err := h.s.Create(c.Context(), in.Name, in.Description)
 	if err != nil {
@@ -66,7 +67,7 @@ func (h *Handler) List(c fiber.Ctx) error {
 func (h *Handler) Get(c fiber.Ctx) error {
 	id, err := strconv.Atoi(c.Params("id"))
 	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid id"})
+		return httpx.Error(c, fiber.StatusBadRequest, "invalid id")
 	}
 	r, err := h.s.Get(c.Context(), uint(id))
 	if err != nil {
@@ -78,11 +79,11 @@ func (h *Handler) Get(c fiber.Ctx) error {
 func (h *Handler) Update(c fiber.Ctx) error {
 	id, err := strconv.Atoi(c.Params("id"))
 	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid id"})
+		return httpx.Error(c, fiber.StatusBadRequest, "invalid id")
 	}
 	var in routineInput
 	if err := c.Bind().Body(&in); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
+		return httpx.Error(c, fiber.StatusBadRequest, "invalid body")
 	}
 	r, err := h.s.Update(c.Context(), uint(id), in.Name, in.Description)
 	if err != nil {
@@ -94,7 +95,7 @@ func (h *Handler) Update(c fiber.Ctx) error {
 func (h *Handler) Delete(c fiber.Ctx) error {
 	id, err := strconv.Atoi(c.Params("id"))
 	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid id"})
+		return httpx.Error(c, fiber.StatusBadRequest, "invalid id")
 	}
 	if err := h.s.Delete(c.Context(), uint(id)); err != nil {
 		return mapError(c, err)
@@ -105,7 +106,7 @@ func (h *Handler) Delete(c fiber.Ctx) error {
 func (h *Handler) Complete(c fiber.Ctx) error {
 	id, err := strconv.Atoi(c.Params("id"))
 	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid id"})
+		return httpx.Error(c, fiber.StatusBadRequest, "invalid id")
 	}
 	log, err := h.s.Complete(c.Context(), uint(id))
 	if err != nil {
@@ -123,7 +124,7 @@ func (h *Handler) DailyHistory(c fiber.Ctx) error {
 	}
 	day, err := time.Parse("2006-01-02", dateStr)
 	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid date"})
+		return httpx.Error(c, fiber.StatusBadRequest, "invalid date")
 	}
 	entries, err := h.s.DailyHistory(c.Context(), day)
 	if err != nil {
@@ -135,12 +136,12 @@ func (h *Handler) DailyHistory(c fiber.Ctx) error {
 func mapError(c fiber.Ctx, err error) error {
 	switch {
 	case errors.Is(err, domain.ErrRoutineNotFound):
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "routine not found"})
+		return httpx.Error(c, fiber.StatusNotFound, "routine not found")
 	case errors.Is(err, domain.ErrDuplicateName):
-		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "routine name already exists"})
+		return httpx.Error(c, fiber.StatusConflict, "routine name already exists")
 	case errors.Is(err, domain.ErrNameRequired), errors.Is(err, domain.ErrNameTooLong), errors.Is(err, domain.ErrDescriptionTooLong):
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		return httpx.Error(c, fiber.StatusBadRequest, err.Error())
 	default:
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "internal server error"})
+		return httpx.Error(c, fiber.StatusInternalServerError, "internal server error")
 	}
 }

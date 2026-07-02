@@ -11,15 +11,15 @@ import (
 )
 
 type transactionRecord struct {
-	ID                    uint           `gorm:"primaryKey"`
-	TransactionCategoryID uint           `gorm:"not null;index"`
-	Amount                int64          `gorm:"not null"`
-	Type                  string         `gorm:"not null;index;type:varchar(20)"`
-	Note                  string         `gorm:"type:text"`
-	Date                  time.Time      `gorm:"not null;index"`
-	CreatedAt             time.Time      `gorm:"autoCreateTime"`
-	UpdatedAt             time.Time      `gorm:"autoUpdateTime"`
-	DeletedAt             gorm.DeletedAt `gorm:"index"`
+	ID         uint           `gorm:"primaryKey"`
+	CategoryID uint           `gorm:"not null;index"`
+	Amount     int64          `gorm:"not null"`
+	Type       string         `gorm:"not null;index;type:varchar(20)"`
+	Note       string         `gorm:"type:text"`
+	Date       time.Time      `gorm:"not null;index"`
+	CreatedAt  time.Time      `gorm:"autoCreateTime"`
+	UpdatedAt  time.Time      `gorm:"autoUpdateTime"`
+	DeletedAt  gorm.DeletedAt `gorm:"index"`
 }
 
 func (transactionRecord) TableName() string { return "transactions" }
@@ -39,17 +39,17 @@ func Models() []any { return []any{&transactionRecord{}, &transactionCategoryRec
 // mappers
 
 func txToDomain(rec transactionRecord) *domain.Transaction {
-	return domain.HydrateTransaction(rec.ID, rec.TransactionCategoryID, rec.Amount, domain.TransactionType(rec.Type), rec.Note, rec.Date)
+	return domain.HydrateTransaction(rec.ID, rec.CategoryID, rec.Amount, domain.TransactionType(rec.Type), rec.Note, rec.Date)
 }
 
 func txToRecord(t *domain.Transaction) transactionRecord {
 	return transactionRecord{
-		ID:                    t.ID(),
-		TransactionCategoryID: t.TransactionCategoryID(),
-		Amount:                t.Amount(),
-		Type:                  string(t.Type()),
-		Note:                  t.Note(),
-		Date:                  t.Date(),
+		ID:         t.ID(),
+		CategoryID: t.CategoryID(),
+		Amount:     t.Amount(),
+		Type:       string(t.Type()),
+		Note:       t.Note(),
+		Date:       t.Date(),
 	}
 }
 
@@ -126,6 +126,52 @@ func (r TransactionGormRepository) Delete(ctx context.Context, id uint) error {
 		return domain.ErrTransactionNotFound
 	}
 	return nil
+}
+
+func (r *TransactionGormRepository) SummaryBetween(ctx context.Context, from, to time.Time) (*domain.Summary, error) {
+	type row struct {
+		CategoryID uint
+		Total      int64
+		Type       domain.TransactionType
+	}
+	var rows []row
+	err := r.db.WithContext(ctx).
+		Model(&transactionRecord{}).
+		Select("category_id, SUM(amount) as total, type").
+		Where("date BETWEEN ? AND ?", from, to).
+		Group("type, category_id").
+		Scan(&rows).Error
+
+	if err != nil {
+		return nil, err
+	}
+	totalIncome := int64(0)
+	totalExpense := int64(0)
+	categories := []domain.CategorySummary{}
+	byCat := map[uint]*domain.CategorySummary{}
+	for _, row := range rows {
+		switch row.Type {
+		case domain.Income:
+			totalIncome += row.Total
+		case domain.Expense:
+			totalExpense += row.Total
+		default:
+			return nil, domain.ErrInvalidType
+		}
+		c, ok := byCat[row.CategoryID]
+		if !ok {
+			c = &domain.CategorySummary{ID: row.CategoryID}
+			byCat[row.CategoryID] = c
+		}
+		switch row.Type {
+		case domain.Income:
+			c.TotalIncome += row.Total
+		case domain.Expense:
+			c.TotalExpense += row.Total
+		}
+	}
+	summary := domain.NewSummary(totalIncome, totalExpense, categories)
+	return summary, nil
 }
 
 // TransactionCategory Repository

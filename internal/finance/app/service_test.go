@@ -41,7 +41,7 @@ func (f *fakeRepo) Save(_ context.Context, t *domain.Transaction) error {
 		f.seq++
 		id = f.seq
 	}
-	stored := domain.HydrateTransaction(id, t.TransactionCategoryID(), t.Amount(), t.Type(), t.Note(), t.Date())
+	stored := domain.HydrateTransaction(id, t.CategoryID(), t.Amount(), t.Type(), t.Note(), t.Date())
 	f.transactions[id] = stored
 	*t = *stored
 	return nil
@@ -57,7 +57,7 @@ func (f *fakeRepo) SaveMany(_ context.Context, ts []*domain.Transaction) error {
 			f.seq++
 			id = f.seq
 		}
-		stored := domain.HydrateTransaction(id, t.TransactionCategoryID(), t.Amount(), t.Type(), t.Note(), t.Date())
+		stored := domain.HydrateTransaction(id, t.CategoryID(), t.Amount(), t.Type(), t.Note(), t.Date())
 		f.transactions[id] = stored
 		*ts[i] = *stored
 	}
@@ -85,6 +85,10 @@ func (f *fakeRepo) Delete(_ context.Context, id uint) error {
 	}
 	delete(f.transactions, id)
 	return nil
+}
+
+func (f *fakeRepo) SummaryBetween(_ context.Context, _ time.Time, _ time.Time) (*domain.Summary, error) {
+	return nil, nil
 }
 
 // Category Repository
@@ -128,13 +132,24 @@ func (f *fakeCategoryRepo) Delete(_ context.Context, id uint) error {
 
 // Transaction Tests
 func TestCreate_PersistsAndAssignsID(t *testing.T) {
-	svc := app.NewService(newFakeRepo(), newFakeCategoryRepo())
-	tx, err := svc.Create(context.Background(), 1, 100, domain.Income, "test", time.Now())
+	cat := newFakeCategoryRepo()
+	seeded, _ := domain.NewTransactionCategory("Food")
+	_ = cat.Save(context.Background(), seeded)
+
+	svc := app.NewService(newFakeRepo(), cat)
+	tx, err := svc.Create(context.Background(), seeded.ID(), 100, domain.Income, "test", time.Now())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if tx.ID() == 0 {
 		t.Fatalf("expected a generated id, got 0")
+	}
+}
+
+func TestCreate_RejectsUnknownCategory(t *testing.T) {
+	svc := app.NewService(newFakeRepo(), newFakeCategoryRepo())
+	if _, err := svc.Create(context.Background(), 999, 100, domain.Income, "test", time.Now()); !errors.Is(err, domain.ErrTransactionCategoryNotFound) {
+		t.Fatalf("want ErrTransactionCategoryNotFound, got %v", err)
 	}
 }
 
@@ -194,8 +209,8 @@ func TestBulkCreate_PersistsAllOrNothing(t *testing.T) {
 		if tx.ID() == 0 {
 			t.Fatalf("expected a generated id, got 0")
 		}
-		if tx.TransactionCategoryID() != txs[i].TransactionCategoryID() {
-			t.Fatalf("want category ID %d, got %d", txs[i].TransactionCategoryID(), tx.TransactionCategoryID())
+		if tx.CategoryID() != txs[i].CategoryID() {
+			t.Fatalf("want category ID %d, got %d", txs[i].CategoryID(), tx.CategoryID())
 		}
 		if tx.Amount() != txs[i].Amount() {
 			t.Fatalf("want amount %d, got %d", txs[i].Amount(), tx.Amount())
@@ -218,23 +233,23 @@ func TestBulkCreate_PersistsAllOrNothing(t *testing.T) {
 		t.Fatalf("want %d transactions, got %d", len(txs), len(all))
 	}
 	for i, tx := range all {
-		if tx.ID() == 0 {
+		if tx.Transaction.ID() == 0 {
 			t.Fatalf("expected a generated id, got 0")
 		}
-		if tx.TransactionCategoryID() != txs[i].TransactionCategoryID() {
-			t.Fatalf("want category ID %d, got %d", txs[i].TransactionCategoryID(), tx.TransactionCategoryID())
+		if tx.Transaction.CategoryID() != txs[i].CategoryID() {
+			t.Fatalf("want category ID %d, got %d", txs[i].CategoryID(), tx.Transaction.CategoryID())
 		}
-		if tx.Amount() != txs[i].Amount() {
-			t.Fatalf("want amount %d, got %d", txs[i].Amount(), tx.Amount())
+		if tx.Transaction.Amount() != txs[i].Amount() {
+			t.Fatalf("want amount %d, got %d", txs[i].Amount(), tx.Transaction.Amount())
 		}
-		if tx.Type() != txs[i].Type() {
-			t.Fatalf("want type %s, got %s", txs[i].Type(), tx.Type())
+		if tx.Transaction.Type() != txs[i].Type() {
+			t.Fatalf("want type %s, got %s", txs[i].Type(), tx.Transaction.Type())
 		}
-		if tx.Note() != txs[i].Note() {
-			t.Fatalf("want note %s, got %s", txs[i].Note(), tx.Note())
+		if tx.Transaction.Note() != txs[i].Note() {
+			t.Fatalf("want note %s, got %s", txs[i].Note(), tx.Transaction.Note())
 		}
-		if tx.Date() != txs[i].Date() {
-			t.Fatalf("want date %s, got %s", txs[i].Date(), tx.Date())
+		if tx.Transaction.Date() != txs[i].Date() {
+			t.Fatalf("want date %s, got %s", txs[i].Date(), tx.Transaction.Date())
 		}
 	}
 }

@@ -11,5 +11,5 @@ FROM alpine:3.20
 WORKDIR /app
 COPY --from=builder /src/server .
 COPY config.yml .
-EXPOSE 8080
+EXPOSE 8088
 CMD ["./server"]

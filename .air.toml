@@ -10,7 +10,8 @@ tmp_dir = "tmp"
     delay = 1000
     include_ext = ["go", "yml", "yaml", "toml"]
     exclude_dir = ["tmp", "vendor"]
-    kill_delay = "0s"
+    kill_delay = "2s"
+    send_interrupt = true
 
 [log]
     time = true
